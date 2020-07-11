@@ -1,6 +1,4 @@
-// Copyright 2017 Vector Creations Ltd
-// Copyright 2018 New Vector Ltd
-// Copyright 2019-2020 The Matrix.org Foundation C.I.C.
+// Copyright 2020 The Matrix.org Foundation C.I.C.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,7 +27,6 @@ import (
 	p2phttp "github.com/libp2p/go-libp2p-http"
 	p2pdisc "github.com/libp2p/go-libp2p/p2p/discovery"
 	"github.com/matrix-org/dendrite/appservice"
-	"github.com/matrix-org/dendrite/cmd/dendrite-demo-libp2p/storage"
 	"github.com/matrix-org/dendrite/currentstateserver"
 	"github.com/matrix-org/dendrite/eduserver"
 	"github.com/matrix-org/dendrite/federationsender"
@@ -130,7 +127,6 @@ func main() {
 	cfg.Database.ServerKey = config.DataSource(fmt.Sprintf("file:%s-serverkey.db", *instanceName))
 	cfg.Database.FederationSender = config.DataSource(fmt.Sprintf("file:%s-federationsender.db", *instanceName))
 	cfg.Database.AppService = config.DataSource(fmt.Sprintf("file:%s-appservice.db", *instanceName))
-	cfg.Database.PublicRoomsAPI = config.DataSource(fmt.Sprintf("file:%s-publicrooms.db", *instanceName))
 	cfg.Database.Naffka = config.DataSource(fmt.Sprintf("file:%s-naffka.db", *instanceName))
 	cfg.Database.CurrentState = config.DataSource(fmt.Sprintf("file:%s-currentstate.db", *instanceName))
 	if err = cfg.Derive(); err != nil {
@@ -164,11 +160,12 @@ func main() {
 		&base.Base, federation, rsAPI, keyRing,
 	)
 	rsAPI.SetFederationSenderAPI(fsAPI)
-	publicRoomsDB, err := storage.NewPublicRoomsServerDatabaseWithPubSub(string(base.Base.Cfg.Database.PublicRoomsAPI), base.LibP2PPubsub, cfg.Matrix.ServerName)
-	if err != nil {
-		logrus.WithError(err).Panicf("failed to connect to public rooms db")
-	}
 	stateAPI := currentstateserver.NewInternalAPI(base.Base.Cfg, base.Base.KafkaConsumer)
+	provider := newPublicRoomsProvider(base.LibP2PPubsub, rsAPI, stateAPI)
+	err = provider.Start()
+	if err != nil {
+		panic("failed to create new public rooms provider: " + err.Error())
+	}
 
 	monolith := setup.Monolith{
 		Config:        base.Base.Cfg,
@@ -180,15 +177,14 @@ func main() {
 		KafkaConsumer: base.Base.KafkaConsumer,
 		KafkaProducer: base.Base.KafkaProducer,
 
-		AppserviceAPI:       asAPI,
-		EDUInternalAPI:      eduInputAPI,
-		FederationSenderAPI: fsAPI,
-		RoomserverAPI:       rsAPI,
-		ServerKeyAPI:        serverKeyAPI,
-		StateAPI:            stateAPI,
-		UserAPI:             userAPI,
-
-		PublicRoomsDB: publicRoomsDB,
+		AppserviceAPI:          asAPI,
+		EDUInternalAPI:         eduInputAPI,
+		FederationSenderAPI:    fsAPI,
+		RoomserverAPI:          rsAPI,
+		ServerKeyAPI:           serverKeyAPI,
+		StateAPI:               stateAPI,
+		UserAPI:                userAPI,
+		ExtPublicRoomsProvider: provider,
 	}
 	monolith.AddAllPublicRoutes(base.Base.PublicAPIMux)
 

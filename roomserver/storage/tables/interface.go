@@ -14,6 +14,7 @@ type EventJSONPair struct {
 }
 
 type EventJSON interface {
+	// Insert the event JSON. On conflict, replace the event JSON with the new value (for redactions).
 	InsertEventJSON(ctx context.Context, tx *sql.Tx, eventNID types.EventNID, eventJSON []byte) error
 	BulkSelectEventJSON(ctx context.Context, eventNIDs []types.EventNID) ([]EventJSONPair, error)
 }
@@ -119,4 +120,30 @@ type Membership interface {
 	SelectMembershipsFromRoom(ctx context.Context, roomNID types.RoomNID, localOnly bool) (eventNIDs []types.EventNID, err error)
 	SelectMembershipsFromRoomAndMembership(ctx context.Context, roomNID types.RoomNID, membership MembershipState, localOnly bool) (eventNIDs []types.EventNID, err error)
 	UpdateMembership(ctx context.Context, txn *sql.Tx, roomNID types.RoomNID, targetUserNID types.EventStateKeyNID, senderUserNID types.EventStateKeyNID, membership MembershipState, eventNID types.EventNID) error
+}
+
+type Published interface {
+	UpsertRoomPublished(ctx context.Context, roomID string, published bool) (err error)
+	SelectPublishedFromRoomID(ctx context.Context, roomID string) (published bool, err error)
+	SelectAllPublishedRooms(ctx context.Context, published bool) ([]string, error)
+}
+
+type RedactionInfo struct {
+	// whether this redaction is validated (we have both events)
+	Validated bool
+	// the ID of the event being redacted
+	RedactsEventID string
+	// the ID of the redaction event
+	RedactionEventID string
+}
+
+type Redactions interface {
+	InsertRedaction(ctx context.Context, txn *sql.Tx, info RedactionInfo) error
+	// SelectRedactionInfoByRedactionEventID returns the redaction info for the given redaction event ID, or nil if there is no match.
+	SelectRedactionInfoByRedactionEventID(ctx context.Context, txn *sql.Tx, redactionEventID string) (*RedactionInfo, error)
+	// SelectRedactionInfoByEventBeingRedacted returns the redaction info for the given redacted event ID, or nil if there is no match.
+	SelectRedactionInfoByEventBeingRedacted(ctx context.Context, txn *sql.Tx, eventID string) (*RedactionInfo, error)
+	// Mark this redaction event as having been validated. This means we have both sides of the redaction and have
+	// successfully redacted the event JSON.
+	MarkRedactionValidated(ctx context.Context, txn *sql.Tx, redactionEventID string, validated bool) error
 }

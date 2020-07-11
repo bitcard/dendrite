@@ -3,6 +3,7 @@ package gobind
 import (
 	"context"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/http"
@@ -11,24 +12,31 @@ import (
 	"github.com/matrix-org/dendrite/appservice"
 	"github.com/matrix-org/dendrite/cmd/dendrite-demo-yggdrasil/signing"
 	"github.com/matrix-org/dendrite/cmd/dendrite-demo-yggdrasil/yggconn"
+	"github.com/matrix-org/dendrite/cmd/dendrite-demo-yggdrasil/yggrooms"
 	"github.com/matrix-org/dendrite/currentstateserver"
 	"github.com/matrix-org/dendrite/eduserver"
 	"github.com/matrix-org/dendrite/eduserver/cache"
 	"github.com/matrix-org/dendrite/federationsender"
+	"github.com/matrix-org/dendrite/federationsender/api"
 	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/httputil"
 	"github.com/matrix-org/dendrite/internal/setup"
-	"github.com/matrix-org/dendrite/publicroomsapi/storage"
 	"github.com/matrix-org/dendrite/roomserver"
 	"github.com/matrix-org/dendrite/userapi"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/sirupsen/logrus"
+	"github.com/yggdrasil-network/yggdrasil-go/src/crypto"
+	"go.uber.org/atomic"
 )
 
 type DendriteMonolith struct {
+	logger           logrus.Logger
 	YggdrasilNode    *yggconn.Node
 	StorageDirectory string
 	listener         net.Listener
+	httpServer       *http.Server
+	httpListening    atomic.Bool
+	yggListening     atomic.Bool
 }
 
 func (m *DendriteMonolith) BaseURL() string {
@@ -39,10 +47,27 @@ func (m *DendriteMonolith) PeerCount() int {
 	return m.YggdrasilNode.PeerCount()
 }
 
+func (m *DendriteMonolith) SetMulticastEnabled(enabled bool) {
+	m.YggdrasilNode.SetMulticastEnabled(enabled)
+}
+
+func (m *DendriteMonolith) SetStaticPeer(uri string) error {
+	return m.YggdrasilNode.SetStaticPeer(uri)
+}
+
+func (m *DendriteMonolith) DisconnectNonMulticastPeers() {
+	m.YggdrasilNode.DisconnectNonMulticastPeers()
+}
+
+func (m *DendriteMonolith) DisconnectMulticastPeers() {
+	m.YggdrasilNode.DisconnectMulticastPeers()
+}
+
 func (m *DendriteMonolith) Start() {
-	logger := logrus.Logger{
+	m.logger = logrus.Logger{
 		Out: BindLogger{},
 	}
+	m.logger.SetOutput(BindLogger{})
 	logrus.SetOutput(BindLogger{})
 
 	var err error
@@ -51,7 +76,7 @@ func (m *DendriteMonolith) Start() {
 		panic(err)
 	}
 
-	ygg, err := yggconn.Setup("dendrite", "", m.StorageDirectory)
+	ygg, err := yggconn.Setup("dendrite", m.StorageDirectory)
 	if err != nil {
 		panic(err)
 	}
@@ -75,9 +100,10 @@ func (m *DendriteMonolith) Start() {
 	cfg.Database.ServerKey = config.DataSource(fmt.Sprintf("file:%s/dendrite-serverkey.db", m.StorageDirectory))
 	cfg.Database.FederationSender = config.DataSource(fmt.Sprintf("file:%s/dendrite-federationsender.db", m.StorageDirectory))
 	cfg.Database.AppService = config.DataSource(fmt.Sprintf("file:%s/dendrite-appservice.db", m.StorageDirectory))
-	cfg.Database.PublicRoomsAPI = config.DataSource(fmt.Sprintf("file:%s/dendrite-publicroomsa.db", m.StorageDirectory))
 	cfg.Database.CurrentState = config.DataSource(fmt.Sprintf("file:%s/dendrite-currentstate.db", m.StorageDirectory))
 	cfg.Database.Naffka = config.DataSource(fmt.Sprintf("file:%s/dendrite-naffka.db", m.StorageDirectory))
+	cfg.Media.BasePath = config.Path(fmt.Sprintf("%s/tmp", m.StorageDirectory))
+	cfg.Media.AbsBasePath = config.Path(fmt.Sprintf("%s/tmp", m.StorageDirectory))
 	if err = cfg.Derive(); err != nil {
 		panic(err)
 	}
@@ -111,11 +137,6 @@ func (m *DendriteMonolith) Start() {
 	// This is different to rsAPI which can be the http client which doesn't need this dependency
 	rsAPI.SetFederationSenderAPI(fsAPI)
 
-	publicRoomsDB, err := storage.NewPublicRoomsServerDatabase(string(base.Cfg.Database.PublicRoomsAPI), base.Cfg.DbProperties(), cfg.Matrix.ServerName)
-	if err != nil {
-		logrus.WithError(err).Panicf("failed to connect to public rooms db")
-	}
-
 	stateAPI := currentstateserver.NewInternalAPI(base.Cfg, base.KafkaConsumer)
 
 	monolith := setup.Monolith{
@@ -134,9 +155,9 @@ func (m *DendriteMonolith) Start() {
 		RoomserverAPI:       rsAPI,
 		UserAPI:             userAPI,
 		StateAPI:            stateAPI,
-		//ServerKeyAPI:        serverKeyAPI,
-
-		PublicRoomsDB: publicRoomsDB,
+		ExtPublicRoomsProvider: yggrooms.NewYggdrasilRoomProvider(
+			ygg, fsAPI, federation,
+		),
 	}
 	monolith.AddAllPublicRoutes(base.PublicAPIMux)
 
@@ -148,12 +169,39 @@ func (m *DendriteMonolith) Start() {
 		base.UseHTTPAPIs,
 	)
 
+	ygg.NewSession = func(serverName gomatrixserverlib.ServerName) {
+		logrus.Infof("Found new session %q", serverName)
+		time.Sleep(time.Second * 3)
+		req := &api.PerformServersAliveRequest{
+			Servers: []gomatrixserverlib.ServerName{serverName},
+		}
+		res := &api.PerformServersAliveResponse{}
+		if err := fsAPI.PerformServersAlive(context.TODO(), req, res); err != nil {
+			logrus.WithError(err).Warn("Failed to notify server alive due to new session")
+		}
+	}
+
+	ygg.NotifyLinkNew(func(_ crypto.BoxPubKey, sigPubKey crypto.SigPubKey, linkType, remote string) {
+		serverName := hex.EncodeToString(sigPubKey[:])
+		logrus.Infof("Found new peer %q", serverName)
+		time.Sleep(time.Second * 3)
+		req := &api.PerformServersAliveRequest{
+			Servers: []gomatrixserverlib.ServerName{
+				gomatrixserverlib.ServerName(serverName),
+			},
+		}
+		res := &api.PerformServersAliveResponse{}
+		if err := fsAPI.PerformServersAlive(context.TODO(), req, res); err != nil {
+			logrus.WithError(err).Warn("Failed to notify server alive due to new session")
+		}
+	})
+
 	// Build both ends of a HTTP multiplex.
-	httpServer := &http.Server{
+	m.httpServer = &http.Server{
 		Addr:         ":0",
 		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 45 * time.Second,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
 		BaseContext: func(_ net.Listener) context.Context {
 			return context.Background()
@@ -161,12 +209,33 @@ func (m *DendriteMonolith) Start() {
 		Handler: base.BaseMux,
 	}
 
-	go func() {
-		logger.Info("Listening on ", ygg.DerivedServerName())
-		logger.Fatal(httpServer.Serve(ygg))
-	}()
-	go func() {
-		logger.Info("Listening on ", m.BaseURL())
-		logger.Fatal(httpServer.Serve(m.listener))
-	}()
+	m.Resume()
+}
+
+func (m *DendriteMonolith) Resume() {
+	logrus.Info("Resuming monolith")
+	if listener, err := net.Listen("tcp", "localhost:65432"); err == nil {
+		m.listener = listener
+	}
+	if m.yggListening.CAS(false, true) {
+		go func() {
+			m.logger.Info("Listening on ", m.YggdrasilNode.DerivedServerName())
+			m.logger.Fatal(m.httpServer.Serve(m.YggdrasilNode))
+			m.yggListening.Store(false)
+		}()
+	}
+	if m.httpListening.CAS(false, true) {
+		go func() {
+			m.logger.Info("Listening on ", m.BaseURL())
+			m.logger.Fatal(m.httpServer.Serve(m.listener))
+			m.httpListening.Store(false)
+		}()
+	}
+}
+
+func (m *DendriteMonolith) Suspend() {
+	m.logger.Info("Suspending monolith")
+	if err := m.httpServer.Close(); err != nil {
+		m.logger.Warn("Error stopping HTTP server:", err)
+	}
 }

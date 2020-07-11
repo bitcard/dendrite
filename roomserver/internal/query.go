@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/matrix-org/dendrite/internal/eventutil"
 	"github.com/matrix-org/dendrite/roomserver/api"
 	"github.com/matrix-org/dendrite/roomserver/auth"
 	"github.com/matrix-org/dendrite/roomserver/state"
@@ -867,7 +868,7 @@ func getAuthChain(
 func persistEvents(ctx context.Context, db storage.Database, events []gomatrixserverlib.HeaderedEvent) (types.RoomNID, map[string]types.Event) {
 	var roomNID types.RoomNID
 	backfilledEventMap := make(map[string]types.Event)
-	for _, ev := range events {
+	for j, ev := range events {
 		nidMap, err := db.EventNIDs(ctx, ev.AuthEventIDs())
 		if err != nil { // this shouldn't happen as RequestBackfill already found them
 			logrus.WithError(err).WithField("auth_events", ev.AuthEventIDs()).Error("Failed to find one or more auth events")
@@ -880,10 +881,25 @@ func persistEvents(ctx context.Context, db storage.Database, events []gomatrixse
 			i++
 		}
 		var stateAtEvent types.StateAtEvent
-		roomNID, stateAtEvent, err = db.StoreEvent(ctx, ev.Unwrap(), nil, authNids)
+		var redactedEventID string
+		var redactionEvent *gomatrixserverlib.Event
+		roomNID, stateAtEvent, redactionEvent, redactedEventID, err = db.StoreEvent(ctx, ev.Unwrap(), nil, authNids)
 		if err != nil {
 			logrus.WithError(err).WithField("event_id", ev.EventID()).Error("Failed to persist event")
 			continue
+		}
+		// If storing this event results in it being redacted, then do so.
+		// It's also possible for this event to be a redaction which results in another event being
+		// redacted, which we don't care about since we aren't returning it in this backfill.
+		if redactedEventID == ev.EventID() {
+			eventToRedact := ev.Unwrap()
+			redactedEvent, err := eventutil.RedactEvent(redactionEvent, &eventToRedact)
+			if err != nil {
+				logrus.WithError(err).WithField("event_id", ev.EventID()).Error("Failed to redact event")
+				continue
+			}
+			ev = redactedEvent.Headered(ev.RoomVersion)
+			events[j] = ev
 		}
 		backfilledEventMap[ev.EventID()] = types.Event{
 			EventNID: stateAtEvent.StateEntry.EventNID,
@@ -928,5 +944,18 @@ func (r *RoomserverInternalAPI) QueryRoomVersionForRoom(
 	}
 	response.RoomVersion = roomVersion
 	r.Cache.StoreRoomVersion(request.RoomID, response.RoomVersion)
+	return nil
+}
+
+func (r *RoomserverInternalAPI) QueryPublishedRooms(
+	ctx context.Context,
+	req *api.QueryPublishedRoomsRequest,
+	res *api.QueryPublishedRoomsResponse,
+) error {
+	rooms, err := r.DB.GetPublishedRooms(ctx)
+	if err != nil {
+		return err
+	}
+	res.RoomIDs = rooms
 	return nil
 }

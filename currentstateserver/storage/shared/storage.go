@@ -20,6 +20,7 @@ import (
 	"fmt"
 
 	"github.com/matrix-org/dendrite/currentstateserver/storage/tables"
+	"github.com/matrix-org/dendrite/internal/eventutil"
 	"github.com/matrix-org/dendrite/internal/sqlutil"
 	"github.com/matrix-org/gomatrixserverlib"
 )
@@ -31,6 +32,29 @@ type Database struct {
 
 func (d *Database) GetStateEvent(ctx context.Context, roomID, evType, stateKey string) (*gomatrixserverlib.HeaderedEvent, error) {
 	return d.CurrentRoomState.SelectStateEvent(ctx, roomID, evType, stateKey)
+}
+
+func (d *Database) GetBulkStateContent(ctx context.Context, roomIDs []string, tuples []gomatrixserverlib.StateKeyTuple, allowWildcards bool) ([]tables.StrippedEvent, error) {
+	return d.CurrentRoomState.SelectBulkStateContent(ctx, roomIDs, tuples, allowWildcards)
+}
+
+func (d *Database) RedactEvent(ctx context.Context, redactedEventID string, redactedBecause gomatrixserverlib.HeaderedEvent) error {
+	events, err := d.CurrentRoomState.SelectEventsWithEventIDs(ctx, nil, []string{redactedEventID})
+	if err != nil {
+		return err
+	}
+	if len(events) != 1 {
+		// this will happen for all non-state events
+		return nil
+	}
+	redactionEvent := redactedBecause.Unwrap()
+	eventBeingRedacted := events[0].Unwrap()
+	redactedEvent, err := eventutil.RedactEvent(&redactionEvent, &eventBeingRedacted)
+	if err != nil {
+		return fmt.Errorf("RedactEvent failed: %w", err)
+	}
+	// replace the state event with a redacted version of itself
+	return d.StoreStateEvents(ctx, []gomatrixserverlib.HeaderedEvent{redactedEvent.Headered(redactedBecause.RoomVersion)}, []string{redactedEventID})
 }
 
 func (d *Database) StoreStateEvents(ctx context.Context, addStateEvents []gomatrixserverlib.HeaderedEvent,
@@ -48,20 +72,9 @@ func (d *Database) StoreStateEvents(ctx context.Context, addStateEvents []gomatr
 				// ignore non state events
 				continue
 			}
-			var membershipEnum int
-			if event.Type() == "m.room.member" {
-				membership, err := event.Membership()
-				if err != nil {
-					return err
-				}
-				enum, ok := tables.MembershipToEnum[membership]
-				if !ok {
-					return fmt.Errorf("unknown membership: %s", membership)
-				}
-				membershipEnum = enum
-			}
+			contentVal := tables.ExtractContentValue(&event)
 
-			if err := d.CurrentRoomState.UpsertRoomState(ctx, txn, event, membershipEnum); err != nil {
+			if err := d.CurrentRoomState.UpsertRoomState(ctx, txn, event, contentVal); err != nil {
 				return err
 			}
 		}
@@ -70,9 +83,5 @@ func (d *Database) StoreStateEvents(ctx context.Context, addStateEvents []gomatr
 }
 
 func (d *Database) GetRoomsByMembership(ctx context.Context, userID, membership string) ([]string, error) {
-	enum, ok := tables.MembershipToEnum[membership]
-	if !ok {
-		return nil, fmt.Errorf("unknown membership: %s", membership)
-	}
-	return d.CurrentRoomState.SelectRoomIDsWithMembership(ctx, nil, userID, enum)
+	return d.CurrentRoomState.SelectRoomIDsWithMembership(ctx, nil, userID, membership)
 }

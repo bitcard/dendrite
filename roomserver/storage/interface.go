@@ -63,8 +63,10 @@ type Database interface {
 	SnapshotNIDFromEventID(ctx context.Context, eventID string) (types.StateSnapshotNID, error)
 	// Look up a room version from the room NID.
 	GetRoomVersionForRoomNID(ctx context.Context, roomNID types.RoomNID) (gomatrixserverlib.RoomVersion, error)
-	// Stores a matrix room event in the database
-	StoreEvent(ctx context.Context, event gomatrixserverlib.Event, txnAndSessionID *api.TransactionID, authEventNIDs []types.EventNID) (types.RoomNID, types.StateAtEvent, error)
+	// Stores a matrix room event in the database. Returns the room NID, the state snapshot and the redacted event ID if any, or an error.
+	StoreEvent(
+		ctx context.Context, event gomatrixserverlib.Event, txnAndSessionID *api.TransactionID, authEventNIDs []types.EventNID,
+	) (types.RoomNID, types.StateAtEvent, *gomatrixserverlib.Event, string, error)
 	// Look up the state entries for a list of string event IDs
 	// Returns an error if the there is an error talking to the database
 	// Returns a types.MissingEventError if the event IDs aren't in the database.
@@ -139,4 +141,8 @@ type Database interface {
 	EventsFromIDs(ctx context.Context, eventIDs []string) ([]types.Event, error)
 	// Look up the room version for a given room.
 	GetRoomVersionForRoom(ctx context.Context, roomID string) (gomatrixserverlib.RoomVersion, error)
+	// Publish or unpublish a room from the room directory.
+	PublishRoom(ctx context.Context, roomID string, publish bool) error
+	// Returns a list of room IDs for rooms which are published.
+	GetPublishedRooms(ctx context.Context) ([]string, error)
 }

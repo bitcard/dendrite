@@ -255,3 +255,20 @@ func (d *Database) CleanTransactionPDUs(
 		return nil
 	})
 }
+
+// GetPendingPDUCount returns the number of PDUs waiting to be
+// sent for a given servername.
+func (d *Database) GetPendingPDUCount(
+	ctx context.Context,
+	serverName gomatrixserverlib.ServerName,
+) (int64, error) {
+	return d.selectQueuePDUCount(ctx, nil, serverName)
+}
+
+// GetPendingServerNames returns the server names that have PDUs
+// waiting to be sent.
+func (d *Database) GetPendingServerNames(
+	ctx context.Context,
+) ([]gomatrixserverlib.ServerName, error) {
+	return d.selectQueueServerNames(ctx, nil)
+}

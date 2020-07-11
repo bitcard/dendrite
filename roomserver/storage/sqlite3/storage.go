@@ -110,6 +110,14 @@ func Open(dataSourceName string) (*Database, error) {
 	if err != nil {
 		return nil, err
 	}
+	published, err := NewSqlitePublishedTable(d.db)
+	if err != nil {
+		return nil, err
+	}
+	redactions, err := NewSqliteRedactionsTable(d.db)
+	if err != nil {
+		return nil, err
+	}
 	d.Database = shared.Database{
 		DB:                  d.db,
 		EventsTable:         d.events,
@@ -124,6 +132,8 @@ func Open(dataSourceName string) (*Database, error) {
 		RoomAliasesTable:    roomAliases,
 		InvitesTable:        d.invites,
 		MembershipTable:     d.membership,
+		PublishedTable:      published,
+		RedactionsTable:     redactions,
 	}
 	return &d, nil
 }

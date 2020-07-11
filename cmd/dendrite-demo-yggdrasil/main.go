@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"net"
@@ -27,17 +28,20 @@ import (
 	"github.com/matrix-org/dendrite/cmd/dendrite-demo-yggdrasil/embed"
 	"github.com/matrix-org/dendrite/cmd/dendrite-demo-yggdrasil/signing"
 	"github.com/matrix-org/dendrite/cmd/dendrite-demo-yggdrasil/yggconn"
+	"github.com/matrix-org/dendrite/cmd/dendrite-demo-yggdrasil/yggrooms"
 	"github.com/matrix-org/dendrite/currentstateserver"
 	"github.com/matrix-org/dendrite/eduserver"
 	"github.com/matrix-org/dendrite/eduserver/cache"
 	"github.com/matrix-org/dendrite/federationsender"
+	"github.com/matrix-org/dendrite/federationsender/api"
+	"github.com/matrix-org/dendrite/internal"
 	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/httputil"
 	"github.com/matrix-org/dendrite/internal/setup"
-	"github.com/matrix-org/dendrite/publicroomsapi/storage"
 	"github.com/matrix-org/dendrite/roomserver"
 	"github.com/matrix-org/dendrite/userapi"
 	"github.com/matrix-org/gomatrixserverlib"
+	"github.com/yggdrasil-network/yggdrasil-go/src/crypto"
 
 	"github.com/sirupsen/logrus"
 )
@@ -51,10 +55,17 @@ var (
 // nolint:gocyclo
 func main() {
 	flag.Parse()
+	internal.SetupPprof()
 
-	ygg, err := yggconn.Setup(*instanceName, *instancePeer, ".")
+	ygg, err := yggconn.Setup(*instanceName, ".")
 	if err != nil {
 		panic(err)
+	}
+	ygg.SetMulticastEnabled(true)
+	if instancePeer != nil && *instancePeer != "" {
+		if err = ygg.SetStaticPeer(*instancePeer); err != nil {
+			logrus.WithError(err).Error("Failed to set static peer")
+		}
 	}
 
 	cfg := &config.Dendrite{}
@@ -74,7 +85,6 @@ func main() {
 	cfg.Database.ServerKey = config.DataSource(fmt.Sprintf("file:%s-serverkey.db", *instanceName))
 	cfg.Database.FederationSender = config.DataSource(fmt.Sprintf("file:%s-federationsender.db", *instanceName))
 	cfg.Database.AppService = config.DataSource(fmt.Sprintf("file:%s-appservice.db", *instanceName))
-	cfg.Database.PublicRoomsAPI = config.DataSource(fmt.Sprintf("file:%s-publicrooms.db", *instanceName))
 	cfg.Database.CurrentState = config.DataSource(fmt.Sprintf("file:%s-currentstate.db", *instanceName))
 	cfg.Database.Naffka = config.DataSource(fmt.Sprintf("file:%s-naffka.db", *instanceName))
 	if err = cfg.Derive(); err != nil {
@@ -110,11 +120,6 @@ func main() {
 
 	rsComponent.SetFederationSenderAPI(fsAPI)
 
-	publicRoomsDB, err := storage.NewPublicRoomsServerDatabase(string(base.Cfg.Database.PublicRoomsAPI), base.Cfg.DbProperties(), cfg.Matrix.ServerName)
-	if err != nil {
-		logrus.WithError(err).Panicf("failed to connect to public rooms db")
-	}
-
 	embed.Embed(base.BaseMux, *instancePort, "Yggdrasil Demo")
 
 	stateAPI := currentstateserver.NewInternalAPI(base.Cfg, base.KafkaConsumer)
@@ -136,8 +141,9 @@ func main() {
 		UserAPI:             userAPI,
 		StateAPI:            stateAPI,
 		//ServerKeyAPI:        serverKeyAPI,
-
-		PublicRoomsDB: publicRoomsDB,
+		ExtPublicRoomsProvider: yggrooms.NewYggdrasilRoomProvider(
+			ygg, fsAPI, federation,
+		),
 	}
 	monolith.AddAllPublicRoutes(base.PublicAPIMux)
 
@@ -148,6 +154,31 @@ func main() {
 		cfg,
 		base.UseHTTPAPIs,
 	)
+
+	ygg.NewSession = func(serverName gomatrixserverlib.ServerName) {
+		logrus.Infof("Found new session %q", serverName)
+		req := &api.PerformServersAliveRequest{
+			Servers: []gomatrixserverlib.ServerName{serverName},
+		}
+		res := &api.PerformServersAliveResponse{}
+		if err := fsAPI.PerformServersAlive(context.TODO(), req, res); err != nil {
+			logrus.WithError(err).Warn("Failed to notify server alive due to new session")
+		}
+	}
+
+	ygg.NotifyLinkNew(func(_ crypto.BoxPubKey, sigPubKey crypto.SigPubKey, linkType, remote string) {
+		serverName := hex.EncodeToString(sigPubKey[:])
+		logrus.Infof("Found new peer %q", serverName)
+		req := &api.PerformServersAliveRequest{
+			Servers: []gomatrixserverlib.ServerName{
+				gomatrixserverlib.ServerName(serverName),
+			},
+		}
+		res := &api.PerformServersAliveResponse{}
+		if err := fsAPI.PerformServersAlive(context.TODO(), req, res); err != nil {
+			logrus.WithError(err).Warn("Failed to notify server alive due to new session")
+		}
+	})
 
 	// Build both ends of a HTTP multiplex.
 	httpServer := &http.Server{

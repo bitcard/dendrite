@@ -32,6 +32,7 @@ import (
 )
 
 const maxPDUsPerTransaction = 50
+const queueIdleTimeout = time.Second * 30
 
 // destinationQueue is a queue of events for a single destination.
 // It is responsible for sending the events to the destination and
@@ -52,35 +53,10 @@ type destinationQueue struct {
 	transactionIDMutex sync.Mutex                              // protects transactionID
 	transactionID      gomatrixserverlib.TransactionID         // last transaction ID
 	transactionCount   atomic.Int32                            // how many events in this transaction so far
-	pendingPDUs        atomic.Int32                            // how many PDUs are waiting to be sent
 	pendingEDUs        []*gomatrixserverlib.EDU                // owned by backgroundSend
 	pendingInvites     []*gomatrixserverlib.InviteV2Request    // owned by backgroundSend
-	wakeServerCh       chan bool                               // interrupts idle wait
-	retryServerCh      chan bool                               // interrupts backoff
-}
-
-// retry will clear the blacklist state and attempt to send built up events to the server,
-// resetting and interrupting any backoff timers.
-func (oq *destinationQueue) retry() {
-	// TODO: We don't send all events in the case where the server has been blacklisted as we
-	// drop events instead then. This means we will send the oldest N events (chan size, currently 128)
-	// and then skip ahead a lot which feels non-ideal but equally we can't persist thousands of events
-	// in-memory to maybe-send it one day. Ideally we would just shove these pending events in a database
-	// so we can send a lot of events.
-	//
-	// Interrupt the backoff. If the federation request that happens as a result of this is successful
-	// then the counters will be reset there and the backoff will cancel. If the federation request
-	// fails then we will retry at the current backoff interval, so as to prevent us from spamming
-	// homeservers which are behaving badly.
-	// We need to use an atomic bool here to prevent multiple calls to retry() blocking on the channel
-	// as it is unbuffered.
-	if oq.backingOff.CAS(true, false) {
-		oq.retryServerCh <- true
-	}
-	if !oq.running.Load() {
-		log.Infof("Restarting queue for %s", oq.destination)
-		go oq.backgroundSend()
-	}
+	notifyPDUs         chan bool                               // interrupts idle wait for PDUs
+	interruptBackoff   chan bool                               // interrupts backoff
 }
 
 // Send event adds the event to the pending queue for the destination.
@@ -89,6 +65,7 @@ func (oq *destinationQueue) retry() {
 func (oq *destinationQueue) sendEvent(nid int64) {
 	if oq.statistics.Blacklisted() {
 		// If the destination is blacklisted then drop the event.
+		log.Infof("%s is blacklisted; dropping event", oq.destination)
 		return
 	}
 	// Create a transaction ID. We'll either do this if we don't have
@@ -117,15 +94,13 @@ func (oq *destinationQueue) sendEvent(nid int64) {
 	// We've successfully added a PDU to the transaction so increase
 	// the counter.
 	oq.transactionCount.Add(1)
-	// If the queue isn't running at this point then start it.
-	if !oq.running.Load() {
-		go oq.backgroundSend()
-	}
-	// Signal that we've sent a new PDU. This will cause the queue to
-	// wake up if it's asleep. The return to the Add function will only
-	// be 1 if the previous value was 0, e.g. nothing was waiting before.
-	if oq.pendingPDUs.Add(1) == 1 {
-		oq.wakeServerCh <- true
+	// Wake up the queue if it's asleep.
+	oq.wakeQueueIfNeeded()
+	// If we're blocking on waiting PDUs then tell the queue that we
+	// have work to do.
+	select {
+	case oq.notifyPDUs <- true:
+	default:
 	}
 }
 
@@ -137,9 +112,7 @@ func (oq *destinationQueue) sendEDU(ev *gomatrixserverlib.EDU) {
 		// If the destination is blacklisted then drop the event.
 		return
 	}
-	if !oq.running.Load() {
-		go oq.backgroundSend()
-	}
+	oq.wakeQueueIfNeeded()
 	oq.incomingEDUs <- ev
 }
 
@@ -151,10 +124,46 @@ func (oq *destinationQueue) sendInvite(ev *gomatrixserverlib.InviteV2Request) {
 		// If the destination is blacklisted then drop the event.
 		return
 	}
+	oq.wakeQueueIfNeeded()
+	oq.incomingInvites <- ev
+}
+
+// wakeQueueIfNeeded will wake up the destination queue if it is
+// not already running. If it is running but it is backing off
+// then we will interrupt the backoff, causing any federation
+// requests to retry.
+func (oq *destinationQueue) wakeQueueIfNeeded() {
+	// If we are backing off then interrupt the backoff.
+	if oq.backingOff.CAS(true, false) {
+		oq.interruptBackoff <- true
+	}
+	// If we aren't running then wake up the queue.
 	if !oq.running.Load() {
+		// Start the queue.
 		go oq.backgroundSend()
 	}
-	oq.incomingInvites <- ev
+}
+
+// waitForPDUs returns a channel for pending PDUs, which will be
+// used in backgroundSend select. It returns a closed channel if
+// there is something pending right now, or an open channel if
+// we're waiting for something.
+func (oq *destinationQueue) waitForPDUs() chan bool {
+	pendingPDUs, err := oq.db.GetPendingPDUCount(context.TODO(), oq.destination)
+	if err != nil {
+		log.WithError(err).Errorf("Failed to get pending PDU count on queue %q", oq.destination)
+	}
+	// If there are PDUs pending right now then we'll return a closed
+	// channel. This will mean that the backgroundSend will not block.
+	if pendingPDUs > 0 {
+		ch := make(chan bool, 1)
+		close(ch)
+		return ch
+	}
+	// If there are no PDUs pending right now then instead we'll return
+	// the notify channel, so that backgroundSend can pick up normal
+	// notifications from sendEvent.
+	return oq.notifyPDUs
 }
 
 // backgroundSend is the worker goroutine for sending events.
@@ -168,64 +177,68 @@ func (oq *destinationQueue) backgroundSend() {
 	defer oq.running.Store(false)
 
 	for {
+		pendingPDUs := false
+
 		// If we have nothing to do then wait either for incoming events, or
 		// until we hit an idle timeout.
-		if oq.pendingPDUs.Load() == 0 && len(oq.pendingEDUs) == 0 && len(oq.pendingInvites) == 0 {
-			select {
-			case <-oq.wakeServerCh:
-				// We were woken up because there are new PDUs waiting in the
-				// database.
-			case edu := <-oq.incomingEDUs:
-				// EDUs are handled in-memory for now. We will try to keep
-				// the ordering intact.
-				// TODO: Certain EDU types need persistence, e.g. send-to-device
-				oq.pendingEDUs = append(oq.pendingEDUs, edu)
-				// If there are any more things waiting in the channel queue
-				// then read them. This is safe because we guarantee only
-				// having one goroutine per destination queue, so the channel
-				// isn't being consumed anywhere else.
-				for len(oq.incomingEDUs) > 0 {
-					oq.pendingEDUs = append(oq.pendingEDUs, <-oq.incomingEDUs)
-				}
-			case invite := <-oq.incomingInvites:
-				// There's no strict ordering requirement for invites like
-				// there is for transactions, so we put the invite onto the
-				// front of the queue. This means that if an invite that is
-				// stuck failing already, that it won't block our new invite
-				// from being sent.
-				oq.pendingInvites = append(
-					[]*gomatrixserverlib.InviteV2Request{invite},
-					oq.pendingInvites...,
-				)
-				// If there are any more things waiting in the channel queue
-				// then read them. This is safe because we guarantee only
-				// having one goroutine per destination queue, so the channel
-				// isn't being consumed anywhere else.
-				for len(oq.incomingInvites) > 0 {
-					oq.pendingInvites = append(oq.pendingInvites, <-oq.incomingInvites)
-				}
-			case <-time.After(time.Second * 30):
-				// The worker is idle so stop the goroutine. It'll get
-				// restarted automatically the next time we have an event to
-				// send.
-				return
+		select {
+		case <-oq.waitForPDUs():
+			// We were woken up because there are new PDUs waiting in the
+			// database.
+			pendingPDUs = true
+		case edu := <-oq.incomingEDUs:
+			// EDUs are handled in-memory for now. We will try to keep
+			// the ordering intact.
+			// TODO: Certain EDU types need persistence, e.g. send-to-device
+			oq.pendingEDUs = append(oq.pendingEDUs, edu)
+			// If there are any more things waiting in the channel queue
+			// then read them. This is safe because we guarantee only
+			// having one goroutine per destination queue, so the channel
+			// isn't being consumed anywhere else.
+			for len(oq.incomingEDUs) > 0 {
+				oq.pendingEDUs = append(oq.pendingEDUs, <-oq.incomingEDUs)
 			}
+		case invite := <-oq.incomingInvites:
+			// There's no strict ordering requirement for invites like
+			// there is for transactions, so we put the invite onto the
+			// front of the queue. This means that if an invite that is
+			// stuck failing already, that it won't block our new invite
+			// from being sent.
+			oq.pendingInvites = append(
+				[]*gomatrixserverlib.InviteV2Request{invite},
+				oq.pendingInvites...,
+			)
+			// If there are any more things waiting in the channel queue
+			// then read them. This is safe because we guarantee only
+			// having one goroutine per destination queue, so the channel
+			// isn't being consumed anywhere else.
+			for len(oq.incomingInvites) > 0 {
+				oq.pendingInvites = append(oq.pendingInvites, <-oq.incomingInvites)
+			}
+		case <-time.After(queueIdleTimeout):
+			// The worker is idle so stop the goroutine. It'll get
+			// restarted automatically the next time we have an event to
+			// send.
+			log.Infof("Queue %q has been idle for %s, going to sleep", oq.destination, queueIdleTimeout)
+			return
 		}
 
 		// If we are backing off this server then wait for the
 		// backoff duration to complete first, or until explicitly
 		// told to retry.
 		if backoff, duration := oq.statistics.BackoffDuration(); backoff {
+			log.WithField("duration", duration).Infof("Backing off %s", oq.destination)
 			oq.backingOff.Store(true)
 			select {
 			case <-time.After(duration):
-			case <-oq.retryServerCh:
+			case <-oq.interruptBackoff:
+				log.Infof("Interrupting backoff for %q", oq.destination)
 			}
 			oq.backingOff.Store(false)
 		}
 
 		// If we have pending PDUs or EDUs then construct a transaction.
-		if oq.pendingPDUs.Load() > 0 || len(oq.pendingEDUs) > 0 {
+		if pendingPDUs || len(oq.pendingEDUs) > 0 {
 			// Try sending the next transaction and see what happens.
 			transaction, terr := oq.nextTransaction(oq.pendingEDUs)
 			if terr != nil {
@@ -236,7 +249,17 @@ func (oq *destinationQueue) backgroundSend() {
 					// buffers at this point. The PDU clean-up is already on a defer.
 					oq.cleanPendingEDUs()
 					oq.cleanPendingInvites()
+					log.Infof("Blacklisting %q due to errors", oq.destination)
 					return
+				} else {
+					// We haven't been told to give up terminally yet but we still have
+					// PDUs waiting to be sent. By sending a message into the wake chan,
+					// the next loop iteration will try processing these PDUs again,
+					// subject to the backoff.
+					select {
+					case oq.notifyPDUs <- true:
+					default:
+					}
 				}
 			} else if transaction {
 				// If we successfully sent the transaction then clear out
@@ -256,6 +279,7 @@ func (oq *destinationQueue) backgroundSend() {
 				if giveUp := oq.statistics.Failure(); giveUp {
 					// It's been suggested that we should give up because
 					// the backoff has exceeded a maximum allowable value.
+					log.Infof("Blacklisting %q due to errors", oq.destination)
 					return
 				}
 			} else if sent > 0 {
@@ -317,8 +341,10 @@ func (oq *destinationQueue) nextTransaction(
 	// Ask the database for any pending PDUs from the next transaction.
 	// maxPDUsPerTransaction is an upper limit but we probably won't
 	// actually retrieve that many events.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
 	txid, pdus, err := oq.db.GetNextTransactionPDUs(
-		context.TODO(),        // context
+		ctx,                   // context
 		oq.destination,        // server name
 		maxPDUsPerTransaction, // max events to retrieve
 	)
@@ -361,15 +387,14 @@ func (oq *destinationQueue) nextTransaction(
 	// TODO: we should check for 500-ish fails vs 400-ish here,
 	// since we shouldn't queue things indefinitely in response
 	// to a 400-ish error
-	_, err = oq.client.SendTransaction(context.TODO(), t)
-	switch e := err.(type) {
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second*30)
+	defer cancel()
+	_, err = oq.client.SendTransaction(ctx, t)
+	switch err.(type) {
 	case nil:
-		// No error was returned so the transaction looks to have
-		// been successfully sent.
-		oq.pendingPDUs.Sub(int32(len(t.PDUs)))
 		// Clean up the transaction in the database.
 		if err = oq.db.CleanTransactionPDUs(
-			context.TODO(),
+			context.Background(),
 			t.Destination,
 			t.TransactionID,
 		); err != nil {
@@ -377,15 +402,8 @@ func (oq *destinationQueue) nextTransaction(
 		}
 		return true, nil
 	case gomatrix.HTTPError:
-		// We received a HTTP error back. In this instance we only
-		// should report an error if
-		if e.Code >= 400 && e.Code <= 499 {
-			// We tried but the remote side has sent back a client error.
-			// It's no use retrying because it will happen again.
-			return true, nil
-		}
-		// Otherwise, report that we failed to send the transaction
-		// and we will retry again.
+		// Report that we failed to send the transaction and we
+		// will retry again, subject to backoff.
 		return false, err
 	default:
 		log.WithFields(log.Fields{

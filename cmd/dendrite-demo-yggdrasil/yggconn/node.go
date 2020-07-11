@@ -17,6 +17,7 @@ package yggconn
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -26,12 +27,15 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/lucas-clemente/quic-go"
 	"github.com/matrix-org/dendrite/cmd/dendrite-demo-yggdrasil/convert"
+	"github.com/matrix-org/gomatrixserverlib"
 
-	"github.com/libp2p/go-yamux"
 	yggdrasiladmin "github.com/yggdrasil-network/yggdrasil-go/src/admin"
 	yggdrasilconfig "github.com/yggdrasil-network/yggdrasil-go/src/config"
+	"github.com/yggdrasil-network/yggdrasil-go/src/crypto"
 	yggdrasilmulticast "github.com/yggdrasil-network/yggdrasil-go/src/multicast"
 	"github.com/yggdrasil-network/yggdrasil-go/src/yggdrasil"
 
@@ -39,16 +43,27 @@ import (
 )
 
 type Node struct {
-	core      *yggdrasil.Core
-	config    *yggdrasilconfig.NodeConfig
-	state     *yggdrasilconfig.NodeState
-	admin     *yggdrasiladmin.AdminSocket
-	multicast *yggdrasilmulticast.Multicast
-	log       *gologme.Logger
-	listener  *yggdrasil.Listener
-	dialer    *yggdrasil.Dialer
-	sessions  sync.Map // string -> yamux.Session
-	incoming  chan *yamux.Stream
+	core       *yggdrasil.Core
+	config     *yggdrasilconfig.NodeConfig
+	state      *yggdrasilconfig.NodeState
+	admin      *yggdrasiladmin.AdminSocket
+	multicast  *yggdrasilmulticast.Multicast
+	log        *gologme.Logger
+	packetConn *yggdrasil.PacketConn
+	listener   quic.Listener
+	tlsConfig  *tls.Config
+	quicConfig *quic.Config
+	sessions   sync.Map // string -> quic.Session
+	incoming   chan QUICStream
+	NewSession func(remote gomatrixserverlib.ServerName)
+}
+
+func (n *Node) BuildName() string {
+	return "dendrite"
+}
+
+func (n *Node) BuildVersion() string {
+	return "dev"
 }
 
 func (n *Node) Dialer(_, address string) (net.Conn, error) {
@@ -67,15 +82,16 @@ func (n *Node) DialerContext(ctx context.Context, network, address string) (net.
 }
 
 // nolint:gocyclo
-func Setup(instanceName, instancePeer, storageDirectory string) (*Node, error) {
+func Setup(instanceName, storageDirectory string) (*Node, error) {
 	n := &Node{
 		core:      &yggdrasil.Core{},
 		config:    yggdrasilconfig.GenerateConfig(),
 		admin:     &yggdrasiladmin.AdminSocket{},
 		multicast: &yggdrasilmulticast.Multicast{},
 		log:       gologme.New(os.Stdout, "YGG ", log.Flags()),
-		incoming:  make(chan *yamux.Stream),
+		incoming:  make(chan QUICStream),
 	}
+	n.core.SetBuildInfo(n)
 
 	yggfile := fmt.Sprintf("%s/%s-yggdrasil.conf", storageDirectory, instanceName)
 	if _, err := os.Stat(yggfile); !os.IsNotExist(err) {
@@ -86,22 +102,22 @@ func Setup(instanceName, instancePeer, storageDirectory string) (*Node, error) {
 		if err := json.Unmarshal([]byte(yggconf), &n.config); err != nil {
 			panic(err)
 		}
-	} else {
-		n.config.AdminListen = "none" // fmt.Sprintf("unix://%s/%s-yggdrasil.sock", storageDirectory, instanceName)
-		n.config.MulticastInterfaces = []string{".*"}
-		n.config.EncryptionPrivateKey = hex.EncodeToString(n.EncryptionPrivateKey())
-		n.config.EncryptionPublicKey = hex.EncodeToString(n.EncryptionPublicKey())
-
-		j, err := json.MarshalIndent(n.config, "", "  ")
-		if err != nil {
-			panic(err)
-		}
-		if e := ioutil.WriteFile(yggfile, j, 0600); e != nil {
-			n.log.Printf("Couldn't write private key to file '%s': %s\n", yggfile, e)
-		}
 	}
 
-	var err error
+	n.config.Peers = []string{}
+	n.config.AdminListen = "none"
+	n.config.MulticastInterfaces = []string{}
+	n.config.EncryptionPrivateKey = hex.EncodeToString(n.EncryptionPrivateKey())
+	n.config.EncryptionPublicKey = hex.EncodeToString(n.EncryptionPublicKey())
+
+	j, err := json.MarshalIndent(n.config, "", "  ")
+	if err != nil {
+		panic(err)
+	}
+	if e := ioutil.WriteFile(yggfile, j, 0600); e != nil {
+		n.log.Printf("Couldn't write private key to file '%s': %s\n", yggfile, e)
+	}
+
 	n.log.EnableLevel("error")
 	n.log.EnableLevel("warn")
 	n.log.EnableLevel("info")
@@ -109,34 +125,21 @@ func Setup(instanceName, instancePeer, storageDirectory string) (*Node, error) {
 	if err != nil {
 		panic(err)
 	}
-	if instancePeer != "" {
-		if err = n.core.AddPeer(instancePeer, ""); err != nil {
-			panic(err)
-		}
-	}
-	/*
-		if err = n.admin.Init(n.core, n.state, n.log, nil); err != nil {
-			panic(err)
-		}
-		if err = n.admin.Start(); err != nil {
-			panic(err)
-		}
-	*/
 	if err = n.multicast.Init(n.core, n.state, n.log, nil); err != nil {
 		panic(err)
 	}
 	if err = n.multicast.Start(); err != nil {
 		panic(err)
 	}
-	//n.admin.SetupAdminHandlers(n.admin)
-	//n.multicast.SetupAdminHandlers(n.admin)
-	n.listener, err = n.core.ConnListen()
-	if err != nil {
-		panic(err)
-	}
-	n.dialer, err = n.core.ConnDialer()
-	if err != nil {
-		panic(err)
+
+	n.packetConn = n.core.PacketConn()
+	n.tlsConfig = n.generateTLSConfig()
+	n.quicConfig = &quic.Config{
+		MaxIncomingStreams:    0,
+		MaxIncomingUniStreams: 0,
+		KeepAlive:             true,
+		MaxIdleTimeout:        time.Minute * 15,
+		HandshakeTimeout:      time.Second * 15,
 	}
 
 	n.log.Println("Public curve25519:", n.core.EncryptionPublicKey())
@@ -145,6 +148,13 @@ func Setup(instanceName, instancePeer, storageDirectory string) (*Node, error) {
 	go n.listenFromYgg()
 
 	return n, nil
+}
+
+func (n *Node) Stop() {
+	if err := n.multicast.Stop(); err != nil {
+		n.log.Println("Error stopping multicast:", err)
+	}
+	n.core.Stop()
 }
 
 func (n *Node) DerivedServerName() string {
@@ -177,4 +187,90 @@ func (n *Node) SigningPrivateKey() ed25519.PrivateKey {
 
 func (n *Node) PeerCount() int {
 	return len(n.core.GetPeers()) - 1
+}
+
+func (n *Node) KnownNodes() []gomatrixserverlib.ServerName {
+	nodemap := map[string]struct{}{
+		"b5ae50589e50991dd9dd7d59c5c5f7a4521e8da5b603b7f57076272abc58b374": struct{}{},
+	}
+	for _, peer := range n.core.GetSwitchPeers() {
+		nodemap[hex.EncodeToString(peer.SigningKey[:])] = struct{}{}
+	}
+	n.sessions.Range(func(_, v interface{}) bool {
+		session, ok := v.(quic.Session)
+		if !ok {
+			return true
+		}
+		if len(session.ConnectionState().PeerCertificates) != 1 {
+			return true
+		}
+		subjectName := session.ConnectionState().PeerCertificates[0].Subject.CommonName
+		nodemap[subjectName] = struct{}{}
+		return true
+	})
+	var nodes []gomatrixserverlib.ServerName
+	for node := range nodemap {
+		nodes = append(nodes, gomatrixserverlib.ServerName(node))
+	}
+	return nodes
+}
+
+func (n *Node) SetMulticastEnabled(enabled bool) {
+	if enabled {
+		n.config.MulticastInterfaces = []string{".*"}
+	} else {
+		n.config.MulticastInterfaces = []string{}
+	}
+	n.multicast.UpdateConfig(n.config)
+	if !enabled {
+		n.DisconnectMulticastPeers()
+	}
+}
+
+func (n *Node) DisconnectMulticastPeers() {
+	for _, sp := range n.core.GetSwitchPeers() {
+		if !strings.HasPrefix(sp.Endpoint, "fe80") {
+			continue
+		}
+		if err := n.core.DisconnectPeer(sp.Port); err != nil {
+			n.log.Printf("Failed to disconnect port %d: %s", sp.Port, err)
+		}
+	}
+}
+
+func (n *Node) DisconnectNonMulticastPeers() {
+	for _, sp := range n.core.GetSwitchPeers() {
+		if strings.HasPrefix(sp.Endpoint, "fe80") {
+			continue
+		}
+		if err := n.core.DisconnectPeer(sp.Port); err != nil {
+			n.log.Printf("Failed to disconnect port %d: %s", sp.Port, err)
+		}
+	}
+}
+
+func (n *Node) SetStaticPeer(uri string) error {
+	n.config.Peers = []string{}
+	n.core.UpdateConfig(n.config)
+	n.DisconnectNonMulticastPeers()
+	if uri != "" {
+		n.log.Infoln("Adding static peer", uri)
+		if err := n.core.AddPeer(uri, ""); err != nil {
+			n.log.Warnln("Adding static peer failed:", err)
+			return err
+		}
+		if err := n.core.CallPeer(uri, ""); err != nil {
+			n.log.Warnln("Calling static peer failed:", err)
+			return err
+		}
+	}
+	return nil
+}
+
+func (n *Node) NotifyLinkNew(f func(boxPubKey crypto.BoxPubKey, sigPubKey crypto.SigPubKey, linkType, remote string)) {
+	n.core.NotifyLinkNew(f)
+}
+
+func (n *Node) NotifyLinkGone(f func(boxPubKey crypto.BoxPubKey, sigPubKey crypto.SigPubKey, linkType, remote string)) {
+	n.core.NotifyLinkGone(f)
 }

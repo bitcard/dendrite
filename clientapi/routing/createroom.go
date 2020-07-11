@@ -382,7 +382,7 @@ func createRoom(
 			continue
 		}
 		// Build some stripped state for the invite.
-		candidates := append(gomatrixserverlib.UnwrapEventHeaders(builtEvents), *inviteEvent)
+		candidates := append(gomatrixserverlib.UnwrapEventHeaders(builtEvents), inviteEvent.Event)
 		var strippedState []gomatrixserverlib.InviteV2StrippedState
 		for _, event := range candidates {
 			switch event.Type() {
@@ -407,6 +407,19 @@ func createRoom(
 		); perr != nil {
 			util.GetLogger(req.Context()).WithError(perr).Error("SendInvite failed")
 			return perr.JSONResponse()
+		}
+	}
+
+	if r.Visibility == "public" {
+		// expose this room in the published room list
+		var pubRes roomserverAPI.PerformPublishResponse
+		rsAPI.PerformPublish(req.Context(), &roomserverAPI.PerformPublishRequest{
+			RoomID:     roomID,
+			Visibility: "public",
+		}, &pubRes)
+		if pubRes.Error != nil {
+			// treat as non-fatal since the room is already made by this point
+			util.GetLogger(req.Context()).WithError(pubRes.Error).Error("failed to visibility:public")
 		}
 	}
 

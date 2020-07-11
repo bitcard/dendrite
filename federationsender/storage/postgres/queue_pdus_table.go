@@ -59,12 +59,21 @@ const selectQueueReferenceJSONCountSQL = "" +
 	"SELECT COUNT(*) FROM federationsender_queue_pdus" +
 	" WHERE json_nid = $1"
 
+const selectQueuePDUsCountSQL = "" +
+	"SELECT COUNT(*) FROM federationsender_queue_pdus" +
+	" WHERE server_name = $1"
+
+const selectQueueServerNamesSQL = "" +
+	"SELECT DISTINCT server_name FROM federationsender_queue_pdus"
+
 type queuePDUsStatements struct {
 	insertQueuePDUStmt                *sql.Stmt
 	deleteQueueTransactionPDUsStmt    *sql.Stmt
 	selectQueueNextTransactionIDStmt  *sql.Stmt
 	selectQueuePDUsByTransactionStmt  *sql.Stmt
 	selectQueueReferenceJSONCountStmt *sql.Stmt
+	selectQueuePDUsCountStmt          *sql.Stmt
+	selectQueueServerNamesStmt        *sql.Stmt
 }
 
 func (s *queuePDUsStatements) prepare(db *sql.DB) (err error) {
@@ -85,6 +94,12 @@ func (s *queuePDUsStatements) prepare(db *sql.DB) (err error) {
 		return
 	}
 	if s.selectQueueReferenceJSONCountStmt, err = db.Prepare(selectQueueReferenceJSONCountSQL); err != nil {
+		return
+	}
+	if s.selectQueuePDUsCountStmt, err = db.Prepare(selectQueuePDUsCountSQL); err != nil {
+		return
+	}
+	if s.selectQueueServerNamesStmt, err = db.Prepare(selectQueueServerNamesSQL); err != nil {
 		return
 	}
 	return
@@ -144,6 +159,21 @@ func (s *queuePDUsStatements) selectQueueReferenceJSONCount(
 	return count, err
 }
 
+func (s *queuePDUsStatements) selectQueuePDUCount(
+	ctx context.Context, txn *sql.Tx, serverName gomatrixserverlib.ServerName,
+) (int64, error) {
+	var count int64
+	stmt := sqlutil.TxStmt(txn, s.selectQueuePDUsCountStmt)
+	err := stmt.QueryRowContext(ctx, serverName).Scan(&count)
+	if err == sql.ErrNoRows {
+		// It's acceptable for there to be no rows referencing a given
+		// JSON NID but it's not an error condition. Just return as if
+		// there's a zero count.
+		return 0, nil
+	}
+	return count, err
+}
+
 func (s *queuePDUsStatements) selectQueuePDUs(
 	ctx context.Context, txn *sql.Tx,
 	serverName gomatrixserverlib.ServerName,
@@ -163,6 +193,27 @@ func (s *queuePDUsStatements) selectQueuePDUs(
 			return nil, err
 		}
 		result = append(result, nid)
+	}
+
+	return result, rows.Err()
+}
+
+func (s *queuePDUsStatements) selectQueueServerNames(
+	ctx context.Context, txn *sql.Tx,
+) ([]gomatrixserverlib.ServerName, error) {
+	stmt := sqlutil.TxStmt(txn, s.selectQueueServerNamesStmt)
+	rows, err := stmt.QueryContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer internal.CloseAndLogIfError(ctx, rows, "queueFromStmt: rows.close() failed")
+	var result []gomatrixserverlib.ServerName
+	for rows.Next() {
+		var serverName gomatrixserverlib.ServerName
+		if err = rows.Scan(&serverName); err != nil {
+			return nil, err
+		}
+		result = append(result, serverName)
 	}
 
 	return result, rows.Err()

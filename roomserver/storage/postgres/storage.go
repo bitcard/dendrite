@@ -87,6 +87,14 @@ func Open(dataSourceName string, dbProperties sqlutil.DbProperties) (*Database, 
 	if err != nil {
 		return nil, err
 	}
+	published, err := NewPostgresPublishedTable(db)
+	if err != nil {
+		return nil, err
+	}
+	redactions, err := NewPostgresRedactionsTable(db)
+	if err != nil {
+		return nil, err
+	}
 	d.Database = shared.Database{
 		DB:                  db,
 		EventTypesTable:     eventTypes,
@@ -101,6 +109,8 @@ func Open(dataSourceName string, dbProperties sqlutil.DbProperties) (*Database, 
 		RoomAliasesTable:    roomAliases,
 		InvitesTable:        invites,
 		MembershipTable:     membership,
+		PublishedTable:      published,
+		RedactionsTable:     redactions,
 	}
 	return &d, nil
 }
