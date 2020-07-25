@@ -17,7 +17,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"encoding/hex"
 	"flag"
 	"fmt"
 	"net"
@@ -38,10 +37,10 @@ import (
 	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/httputil"
 	"github.com/matrix-org/dendrite/internal/setup"
+	"github.com/matrix-org/dendrite/keyserver"
 	"github.com/matrix-org/dendrite/roomserver"
 	"github.com/matrix-org/dendrite/userapi"
 	"github.com/matrix-org/gomatrixserverlib"
-	"github.com/yggdrasil-network/yggdrasil-go/src/crypto"
 
 	"github.com/sirupsen/logrus"
 )
@@ -73,6 +72,7 @@ func main() {
 	cfg.Matrix.ServerName = gomatrixserverlib.ServerName(ygg.DerivedServerName())
 	cfg.Matrix.PrivateKey = ygg.SigningPrivateKey()
 	cfg.Matrix.KeyID = gomatrixserverlib.KeyID(signing.KeyID)
+	cfg.Matrix.FederationMaxRetries = 6
 	cfg.Kafka.UseNaffka = true
 	cfg.Kafka.Topics.OutputRoomEvent = "roomserverOutput"
 	cfg.Kafka.Topics.OutputClientData = "clientapiOutput"
@@ -87,6 +87,7 @@ func main() {
 	cfg.Database.AppService = config.DataSource(fmt.Sprintf("file:%s-appservice.db", *instanceName))
 	cfg.Database.CurrentState = config.DataSource(fmt.Sprintf("file:%s-currentstate.db", *instanceName))
 	cfg.Database.Naffka = config.DataSource(fmt.Sprintf("file:%s-naffka.db", *instanceName))
+	cfg.Database.E2EKey = config.DataSource(fmt.Sprintf("file:%s-e2ekey.db", *instanceName))
 	if err = cfg.Derive(); err != nil {
 		panic(err)
 	}
@@ -140,6 +141,7 @@ func main() {
 		RoomserverAPI:       rsAPI,
 		UserAPI:             userAPI,
 		StateAPI:            stateAPI,
+		KeyAPI:              keyserver.NewInternalAPI(base.Cfg, federation, userAPI, base.KafkaProducer),
 		//ServerKeyAPI:        serverKeyAPI,
 		ExtPublicRoomsProvider: yggrooms.NewYggdrasilRoomProvider(
 			ygg, fsAPI, federation,
@@ -154,31 +156,6 @@ func main() {
 		cfg,
 		base.UseHTTPAPIs,
 	)
-
-	ygg.NewSession = func(serverName gomatrixserverlib.ServerName) {
-		logrus.Infof("Found new session %q", serverName)
-		req := &api.PerformServersAliveRequest{
-			Servers: []gomatrixserverlib.ServerName{serverName},
-		}
-		res := &api.PerformServersAliveResponse{}
-		if err := fsAPI.PerformServersAlive(context.TODO(), req, res); err != nil {
-			logrus.WithError(err).Warn("Failed to notify server alive due to new session")
-		}
-	}
-
-	ygg.NotifyLinkNew(func(_ crypto.BoxPubKey, sigPubKey crypto.SigPubKey, linkType, remote string) {
-		serverName := hex.EncodeToString(sigPubKey[:])
-		logrus.Infof("Found new peer %q", serverName)
-		req := &api.PerformServersAliveRequest{
-			Servers: []gomatrixserverlib.ServerName{
-				gomatrixserverlib.ServerName(serverName),
-			},
-		}
-		res := &api.PerformServersAliveResponse{}
-		if err := fsAPI.PerformServersAlive(context.TODO(), req, res); err != nil {
-			logrus.WithError(err).Warn("Failed to notify server alive due to new session")
-		}
-	})
 
 	// Build both ends of a HTTP multiplex.
 	httpServer := &http.Server{
@@ -201,6 +178,14 @@ func main() {
 		httpBindAddr := fmt.Sprintf(":%d", *instancePort)
 		logrus.Info("Listening on ", httpBindAddr)
 		logrus.Fatal(http.ListenAndServe(httpBindAddr, base.BaseMux))
+	}()
+	go func() {
+		logrus.Info("Sending wake-up message to known nodes")
+		req := &api.PerformBroadcastEDURequest{}
+		res := &api.PerformBroadcastEDUResponse{}
+		if err := fsAPI.PerformBroadcastEDU(context.TODO(), req, res); err != nil {
+			logrus.WithError(err).Error("Failed to send wake-up message to known nodes")
+		}
 	}()
 
 	select {}

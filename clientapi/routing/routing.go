@@ -31,6 +31,7 @@ import (
 	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/httputil"
 	"github.com/matrix-org/dendrite/internal/transactions"
+	keyserverAPI "github.com/matrix-org/dendrite/keyserver/api"
 	roomserverAPI "github.com/matrix-org/dendrite/roomserver/api"
 	userapi "github.com/matrix-org/dendrite/userapi/api"
 	"github.com/matrix-org/dendrite/userapi/storage/accounts"
@@ -62,6 +63,7 @@ func Setup(
 	transactionsCache *transactions.Cache,
 	federationSender federationSenderAPI.FederationSenderInternalAPI,
 	stateAPI currentstateAPI.CurrentStateInternalAPI,
+	keyAPI keyserverAPI.KeyInternalAPI,
 	extRoomsProvider api.ExtraPublicRoomsProvider,
 ) {
 	userInteractiveAuth := auth.NewUserInteractive(accountDB.GetAccountByPassword, cfg)
@@ -696,16 +698,25 @@ func Setup(
 		}),
 	).Methods(http.MethodGet)
 
-	r0mux.Handle("/keys/query",
-		httputil.MakeAuthAPI("queryKeys", userAPI, func(req *http.Request, device *userapi.Device) util.JSONResponse {
-			return QueryKeys(req)
-		}),
-	).Methods(http.MethodPost, http.MethodOptions)
-
 	// Supplying a device ID is deprecated.
 	r0mux.Handle("/keys/upload/{deviceID}",
 		httputil.MakeAuthAPI("keys_upload", userAPI, func(req *http.Request, device *userapi.Device) util.JSONResponse {
-			return UploadKeys(req)
+			return UploadKeys(req, keyAPI, device)
+		}),
+	).Methods(http.MethodPost, http.MethodOptions)
+	r0mux.Handle("/keys/upload",
+		httputil.MakeAuthAPI("keys_upload", userAPI, func(req *http.Request, device *userapi.Device) util.JSONResponse {
+			return UploadKeys(req, keyAPI, device)
+		}),
+	).Methods(http.MethodPost, http.MethodOptions)
+	r0mux.Handle("/keys/query",
+		httputil.MakeAuthAPI("keys_query", userAPI, func(req *http.Request, device *userapi.Device) util.JSONResponse {
+			return QueryKeys(req, keyAPI)
+		}),
+	).Methods(http.MethodPost, http.MethodOptions)
+	r0mux.Handle("/keys/claim",
+		httputil.MakeAuthAPI("keys_claim", userAPI, func(req *http.Request, device *userapi.Device) util.JSONResponse {
+			return ClaimKeys(req, keyAPI)
 		}),
 	).Methods(http.MethodPost, http.MethodOptions)
 }

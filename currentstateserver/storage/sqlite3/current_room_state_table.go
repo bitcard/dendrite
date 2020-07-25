@@ -66,17 +66,23 @@ const selectBulkStateContentSQL = "" +
 const selectBulkStateContentWildSQL = "" +
 	"SELECT room_id, type, state_key, content_value FROM currentstate_current_room_state WHERE room_id IN ($1) AND type IN ($2)"
 
+const selectJoinedUsersSetForRoomsSQL = "" +
+	"SELECT state_key, COUNT(room_id) FROM currentstate_current_room_state WHERE room_id IN ($1) AND type = 'm.room.member' and content_value = 'join' GROUP BY state_key"
+
 type currentRoomStateStatements struct {
-	db                              *sql.DB
-	upsertRoomStateStmt             *sql.Stmt
-	deleteRoomStateByEventIDStmt    *sql.Stmt
-	selectRoomIDsWithMembershipStmt *sql.Stmt
-	selectStateEventStmt            *sql.Stmt
+	db                               *sql.DB
+	writer                           *sqlutil.TransactionWriter
+	upsertRoomStateStmt              *sql.Stmt
+	deleteRoomStateByEventIDStmt     *sql.Stmt
+	selectRoomIDsWithMembershipStmt  *sql.Stmt
+	selectStateEventStmt             *sql.Stmt
+	selectJoinedUsersSetForRoomsStmt *sql.Stmt
 }
 
 func NewSqliteCurrentRoomStateTable(db *sql.DB) (tables.CurrentRoomState, error) {
 	s := &currentRoomStateStatements{
-		db: db,
+		db:     db,
+		writer: sqlutil.NewTransactionWriter(),
 	}
 	_, err := db.Exec(currentRoomStateSchema)
 	if err != nil {
@@ -94,7 +100,33 @@ func NewSqliteCurrentRoomStateTable(db *sql.DB) (tables.CurrentRoomState, error)
 	if s.selectStateEventStmt, err = db.Prepare(selectStateEventSQL); err != nil {
 		return nil, err
 	}
+	if s.selectJoinedUsersSetForRoomsStmt, err = db.Prepare(selectJoinedUsersSetForRoomsSQL); err != nil {
+		return nil, err
+	}
 	return s, nil
+}
+
+func (s *currentRoomStateStatements) SelectJoinedUsersSetForRooms(ctx context.Context, roomIDs []string) (map[string]int, error) {
+	iRoomIDs := make([]interface{}, len(roomIDs))
+	for i, v := range roomIDs {
+		iRoomIDs[i] = v
+	}
+	query := strings.Replace(selectJoinedUsersSetForRoomsSQL, "($1)", sqlutil.QueryVariadic(len(iRoomIDs)), 1)
+	rows, err := s.db.QueryContext(ctx, query, iRoomIDs...)
+	if err != nil {
+		return nil, err
+	}
+	defer internal.CloseAndLogIfError(ctx, rows, "selectJoinedUsersSetForRooms: rows.close() failed")
+	result := make(map[string]int)
+	for rows.Next() {
+		var userID string
+		var count int
+		if err := rows.Scan(&userID, &count); err != nil {
+			return nil, err
+		}
+		result[userID] = count
+	}
+	return result, rows.Err()
 }
 
 // SelectRoomIDsWithMembership returns the list of room IDs which have the given user in the given membership state.
@@ -125,9 +157,11 @@ func (s *currentRoomStateStatements) SelectRoomIDsWithMembership(
 func (s *currentRoomStateStatements) DeleteRoomStateByEventID(
 	ctx context.Context, txn *sql.Tx, eventID string,
 ) error {
-	stmt := sqlutil.TxStmt(txn, s.deleteRoomStateByEventIDStmt)
-	_, err := stmt.ExecContext(ctx, eventID)
-	return err
+	return s.writer.Do(s.db, txn, func(txn *sql.Tx) error {
+		stmt := sqlutil.TxStmt(txn, s.deleteRoomStateByEventIDStmt)
+		_, err := stmt.ExecContext(ctx, eventID)
+		return err
+	})
 }
 
 func (s *currentRoomStateStatements) UpsertRoomState(
@@ -140,18 +174,20 @@ func (s *currentRoomStateStatements) UpsertRoomState(
 	}
 
 	// upsert state event
-	stmt := sqlutil.TxStmt(txn, s.upsertRoomStateStmt)
-	_, err = stmt.ExecContext(
-		ctx,
-		event.RoomID(),
-		event.EventID(),
-		event.Type(),
-		event.Sender(),
-		*event.StateKey(),
-		headeredJSON,
-		contentVal,
-	)
-	return err
+	return s.writer.Do(s.db, txn, func(txn *sql.Tx) error {
+		stmt := sqlutil.TxStmt(txn, s.upsertRoomStateStmt)
+		_, err = stmt.ExecContext(
+			ctx,
+			event.RoomID(),
+			event.EventID(),
+			event.Type(),
+			event.Sender(),
+			*event.StateKey(),
+			headeredJSON,
+			contentVal,
+		)
+		return err
+	})
 }
 
 func (s *currentRoomStateStatements) SelectEventsWithEventIDs(

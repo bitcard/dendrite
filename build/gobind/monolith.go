@@ -3,7 +3,6 @@ package gobind
 import (
 	"context"
 	"crypto/tls"
-	"encoding/hex"
 	"fmt"
 	"net"
 	"net/http"
@@ -21,11 +20,11 @@ import (
 	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/httputil"
 	"github.com/matrix-org/dendrite/internal/setup"
+	"github.com/matrix-org/dendrite/keyserver"
 	"github.com/matrix-org/dendrite/roomserver"
 	"github.com/matrix-org/dendrite/userapi"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/sirupsen/logrus"
-	"github.com/yggdrasil-network/yggdrasil-go/src/crypto"
 	"go.uber.org/atomic"
 )
 
@@ -87,6 +86,7 @@ func (m *DendriteMonolith) Start() {
 	cfg.Matrix.ServerName = gomatrixserverlib.ServerName(ygg.DerivedServerName())
 	cfg.Matrix.PrivateKey = ygg.SigningPrivateKey()
 	cfg.Matrix.KeyID = gomatrixserverlib.KeyID(signing.KeyID)
+	cfg.Matrix.FederationMaxRetries = 6
 	cfg.Kafka.UseNaffka = true
 	cfg.Kafka.Topics.OutputRoomEvent = "roomserverOutput"
 	cfg.Kafka.Topics.OutputClientData = "clientapiOutput"
@@ -155,6 +155,7 @@ func (m *DendriteMonolith) Start() {
 		RoomserverAPI:       rsAPI,
 		UserAPI:             userAPI,
 		StateAPI:            stateAPI,
+		KeyAPI:              keyserver.NewInternalAPI(base.Cfg, federation, userAPI, base.KafkaProducer),
 		ExtPublicRoomsProvider: yggrooms.NewYggdrasilRoomProvider(
 			ygg, fsAPI, federation,
 		),
@@ -169,33 +170,6 @@ func (m *DendriteMonolith) Start() {
 		base.UseHTTPAPIs,
 	)
 
-	ygg.NewSession = func(serverName gomatrixserverlib.ServerName) {
-		logrus.Infof("Found new session %q", serverName)
-		time.Sleep(time.Second * 3)
-		req := &api.PerformServersAliveRequest{
-			Servers: []gomatrixserverlib.ServerName{serverName},
-		}
-		res := &api.PerformServersAliveResponse{}
-		if err := fsAPI.PerformServersAlive(context.TODO(), req, res); err != nil {
-			logrus.WithError(err).Warn("Failed to notify server alive due to new session")
-		}
-	}
-
-	ygg.NotifyLinkNew(func(_ crypto.BoxPubKey, sigPubKey crypto.SigPubKey, linkType, remote string) {
-		serverName := hex.EncodeToString(sigPubKey[:])
-		logrus.Infof("Found new peer %q", serverName)
-		time.Sleep(time.Second * 3)
-		req := &api.PerformServersAliveRequest{
-			Servers: []gomatrixserverlib.ServerName{
-				gomatrixserverlib.ServerName(serverName),
-			},
-		}
-		res := &api.PerformServersAliveResponse{}
-		if err := fsAPI.PerformServersAlive(context.TODO(), req, res); err != nil {
-			logrus.WithError(err).Warn("Failed to notify server alive due to new session")
-		}
-	})
-
 	// Build both ends of a HTTP multiplex.
 	m.httpServer = &http.Server{
 		Addr:         ":0",
@@ -209,28 +183,22 @@ func (m *DendriteMonolith) Start() {
 		Handler: base.BaseMux,
 	}
 
-	m.Resume()
-}
-
-func (m *DendriteMonolith) Resume() {
-	logrus.Info("Resuming monolith")
-	if listener, err := net.Listen("tcp", "localhost:65432"); err == nil {
-		m.listener = listener
-	}
-	if m.yggListening.CAS(false, true) {
-		go func() {
-			m.logger.Info("Listening on ", m.YggdrasilNode.DerivedServerName())
-			m.logger.Fatal(m.httpServer.Serve(m.YggdrasilNode))
-			m.yggListening.Store(false)
-		}()
-	}
-	if m.httpListening.CAS(false, true) {
-		go func() {
-			m.logger.Info("Listening on ", m.BaseURL())
-			m.logger.Fatal(m.httpServer.Serve(m.listener))
-			m.httpListening.Store(false)
-		}()
-	}
+	go func() {
+		m.logger.Info("Listening on ", ygg.DerivedServerName())
+		m.logger.Fatal(m.httpServer.Serve(ygg))
+	}()
+	go func() {
+		m.logger.Info("Listening on ", m.BaseURL())
+		m.logger.Fatal(m.httpServer.Serve(m.listener))
+	}()
+	go func() {
+		logrus.Info("Sending wake-up message to known nodes")
+		req := &api.PerformBroadcastEDURequest{}
+		res := &api.PerformBroadcastEDUResponse{}
+		if err := fsAPI.PerformBroadcastEDU(context.TODO(), req, res); err != nil {
+			logrus.WithError(err).Error("Failed to send wake-up message to known nodes")
+		}
+	}()
 }
 
 func (m *DendriteMonolith) Suspend() {
