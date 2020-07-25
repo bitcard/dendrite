@@ -119,7 +119,14 @@ Newly banned rooms appear in the leave section of incremental sync
 Newly banned rooms appear in the leave section of incremental sync
 local user can join room with version 1
 User can invite local user to room with version 1
+Can upload device keys
 Should reject keys claiming to belong to a different user
+Can query device keys using POST
+Can query remote device keys using POST
+Can query specific device keys using POST
+query for user with no keys returns empty key dict
+Can claim one time key using POST
+Can claim remote one time key using POST
 Can add account data
 Can add account data to room
 Can get account data without syncing
@@ -280,7 +287,6 @@ Inbound federation of state requires event_id as a mandatory paramater
 Inbound federation can get state_ids for a room
 Inbound federation of state_ids requires event_id as a mandatory paramater
 Federation rejects inbound events where the prev_events cannot be found
-Outbound federation requests missing prev_events and then asks for /state_ids and resolves the state
 Alternative server names do not cause a routing loop
 Events whose auth_events are in the wrong room do not mess up the room state
 Inbound federation can return events
@@ -316,12 +322,12 @@ Can recv a device message using /sync
 Can recv device messages until they are acknowledged 
 Device messages with the same txn_id are deduplicated 
 Device messages wake up /sync 
-# TODO: separate PR for: Can recv device messages over federation 
-# TODO: separate PR for: Device messages over federation wake up /sync 
+Can recv device messages over federation 
+Device messages over federation wake up /sync 
 Can send messages with a wildcard device id 
 Can send messages with a wildcard device id to two devices 
 Wildcard device messages wake up /sync 
-# TODO: separate PR for: Wildcard device messages over federation wake up /sync 
+Wildcard device messages over federation wake up /sync 
 Can send a to-device message to two users which both receive it using /sync
 User can create and send/receive messages in a room with version 6
 local user can join room with version 6
