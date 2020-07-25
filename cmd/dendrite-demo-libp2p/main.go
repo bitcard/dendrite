@@ -145,9 +145,17 @@ func main() {
 		base.Base.Cfg, federation, base.Base.Caches,
 	)
 	keyRing := serverKeyAPI.KeyRing()
-	createKeyDB(
-		base, serverKeyAPI,
-	)
+
+	// createKeyDB(
+	// 	base, serverKeyAPI,
+	// )
+
+	configParam, err1 := ParseFlags()
+	if err1 != nil {
+		panic(err1)
+	}
+	configParam.keydb = serverKeyAPI
+	findPeer(base.LibP2PContext, base.LibP2P, configParam)
 
 	rsAPI := roomserver.NewInternalAPI(
 		&base.Base, keyRing, federation,
