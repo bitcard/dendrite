@@ -57,30 +57,41 @@ const selectJoinedHostsSQL = "" +
 	"SELECT event_id, server_name FROM federationsender_joined_hosts" +
 	" WHERE room_id = $1"
 
+const selectAllJoinedHostsSQL = "" +
+	"SELECT DISTINCT server_name FROM federationsender_joined_hosts"
+
 type joinedHostsStatements struct {
-	insertJoinedHostsStmt *sql.Stmt
-	deleteJoinedHostsStmt *sql.Stmt
-	selectJoinedHostsStmt *sql.Stmt
+	db                       *sql.DB
+	insertJoinedHostsStmt    *sql.Stmt
+	deleteJoinedHostsStmt    *sql.Stmt
+	selectJoinedHostsStmt    *sql.Stmt
+	selectAllJoinedHostsStmt *sql.Stmt
 }
 
-func (s *joinedHostsStatements) prepare(db *sql.DB) (err error) {
-	_, err = db.Exec(joinedHostsSchema)
+func NewPostgresJoinedHostsTable(db *sql.DB) (s *joinedHostsStatements, err error) {
+	s = &joinedHostsStatements{
+		db: db,
+	}
+	_, err = s.db.Exec(joinedHostsSchema)
 	if err != nil {
 		return
 	}
-	if s.insertJoinedHostsStmt, err = db.Prepare(insertJoinedHostsSQL); err != nil {
+	if s.insertJoinedHostsStmt, err = s.db.Prepare(insertJoinedHostsSQL); err != nil {
 		return
 	}
-	if s.deleteJoinedHostsStmt, err = db.Prepare(deleteJoinedHostsSQL); err != nil {
+	if s.deleteJoinedHostsStmt, err = s.db.Prepare(deleteJoinedHostsSQL); err != nil {
 		return
 	}
-	if s.selectJoinedHostsStmt, err = db.Prepare(selectJoinedHostsSQL); err != nil {
+	if s.selectJoinedHostsStmt, err = s.db.Prepare(selectJoinedHostsSQL); err != nil {
+		return
+	}
+	if s.selectAllJoinedHostsStmt, err = s.db.Prepare(selectAllJoinedHostsSQL); err != nil {
 		return
 	}
 	return
 }
 
-func (s *joinedHostsStatements) insertJoinedHosts(
+func (s *joinedHostsStatements) InsertJoinedHosts(
 	ctx context.Context,
 	txn *sql.Tx,
 	roomID, eventID string,
@@ -91,7 +102,7 @@ func (s *joinedHostsStatements) insertJoinedHosts(
 	return err
 }
 
-func (s *joinedHostsStatements) deleteJoinedHosts(
+func (s *joinedHostsStatements) DeleteJoinedHosts(
 	ctx context.Context, txn *sql.Tx, eventIDs []string,
 ) error {
 	stmt := sqlutil.TxStmt(txn, s.deleteJoinedHostsStmt)
@@ -99,17 +110,38 @@ func (s *joinedHostsStatements) deleteJoinedHosts(
 	return err
 }
 
-func (s *joinedHostsStatements) selectJoinedHostsWithTx(
+func (s *joinedHostsStatements) SelectJoinedHostsWithTx(
 	ctx context.Context, txn *sql.Tx, roomID string,
 ) ([]types.JoinedHost, error) {
 	stmt := sqlutil.TxStmt(txn, s.selectJoinedHostsStmt)
 	return joinedHostsFromStmt(ctx, stmt, roomID)
 }
 
-func (s *joinedHostsStatements) selectJoinedHosts(
+func (s *joinedHostsStatements) SelectJoinedHosts(
 	ctx context.Context, roomID string,
 ) ([]types.JoinedHost, error) {
 	return joinedHostsFromStmt(ctx, s.selectJoinedHostsStmt, roomID)
+}
+
+func (s *joinedHostsStatements) SelectAllJoinedHosts(
+	ctx context.Context,
+) ([]gomatrixserverlib.ServerName, error) {
+	rows, err := s.selectAllJoinedHostsStmt.QueryContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer internal.CloseAndLogIfError(ctx, rows, "selectAllJoinedHosts: rows.close() failed")
+
+	var result []gomatrixserverlib.ServerName
+	for rows.Next() {
+		var serverName string
+		if err = rows.Scan(&serverName); err != nil {
+			return nil, err
+		}
+		result = append(result, gomatrixserverlib.ServerName(serverName))
+	}
+
+	return result, rows.Err()
 }
 
 func joinedHostsFromStmt(

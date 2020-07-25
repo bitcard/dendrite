@@ -46,6 +46,8 @@ kafka:
     output_room_event: output.room
     output_client_data: output.client
     output_typing_event: output.typing
+    output_send_to_device_event: output.std
+    output_key_change_event: output.key_change
     user_updates: output.user
 database:
   media_api: "postgresql:///media_api"
@@ -56,6 +58,7 @@ database:
   room_server: "postgresql:///room_server"
   appservice: "postgresql:///appservice"
   current_state: "postgresql:///current_state"
+  e2e_key: "postgresql:///e2e_key"
 listen:
   room_server: "localhost:7770"
   client_api: "localhost:7771"
@@ -66,6 +69,7 @@ listen:
   edu_server: "localhost:7778"
   user_api: "localhost:7779"
   current_state_server: "localhost:7775"
+  key_server: "localhost:7776"
 logging:
   - type: "file"
     level: "info"

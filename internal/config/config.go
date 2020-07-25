@@ -102,6 +102,11 @@ type Dendrite struct {
 		// Perspective keyservers, to use as a backup when direct key fetch
 		// requests don't succeed
 		KeyPerspectives KeyPerspectives `yaml:"key_perspectives"`
+		// Federation failure threshold. How many consecutive failures that we should
+		// tolerate when sending federation requests to a specific server. The backoff
+		// is 2**x seconds, so 1 = 2 seconds, 2 = 4 seconds, 3 = 8 seconds, etc.
+		// The default value is 16 if not specified, which is circa 18 hours.
+		FederationMaxRetries uint32 `yaml:"federation_max_retries"`
 	} `yaml:"matrix"`
 
 	// The configuration specific to the media repostitory.
@@ -154,6 +159,8 @@ type Dendrite struct {
 			OutputTypingEvent Topic `yaml:"output_typing_event"`
 			// Topic for eduserver/api.OutputSendToDeviceEvent events.
 			OutputSendToDeviceEvent Topic `yaml:"output_send_to_device_event"`
+			// Topic for keyserver when new device keys are added.
+			OutputKeyChangeEvent Topic `yaml:"output_key_change_event"`
 		}
 	} `yaml:"kafka"`
 
@@ -174,6 +181,9 @@ type Dendrite struct {
 		// The ServerKey database caches the public keys of remote servers.
 		// It may be accessed by the FederationAPI, the ClientAPI, and the MediaAPI.
 		ServerKey DataSource `yaml:"server_key"`
+		// The E2EKey database stores one-time public keys for devices in addition to
+		// signed device keys. Used for E2E.
+		E2EKey DataSource `yaml:"e2e_key"`
 		// The SyncAPI stores information used by the SyncAPI server.
 		// It is only accessed by the SyncAPI server.
 		SyncAPI DataSource `yaml:"sync_api"`
@@ -476,6 +486,10 @@ func (config *Dendrite) SetDefaults() {
 		config.Matrix.TrustedIDServers = []string{}
 	}
 
+	if config.Matrix.FederationMaxRetries == 0 {
+		config.Matrix.FederationMaxRetries = 16
+	}
+
 	if config.Media.MaxThumbnailGenerators == 0 {
 		config.Media.MaxThumbnailGenerators = 10
 	}
@@ -591,6 +605,8 @@ func (config *Dendrite) checkKafka(configErrs *configErrors, monolithic bool) {
 	checkNotEmpty(configErrs, "kafka.topics.output_room_event", string(config.Kafka.Topics.OutputRoomEvent))
 	checkNotEmpty(configErrs, "kafka.topics.output_client_data", string(config.Kafka.Topics.OutputClientData))
 	checkNotEmpty(configErrs, "kafka.topics.output_typing_event", string(config.Kafka.Topics.OutputTypingEvent))
+	checkNotEmpty(configErrs, "kafka.topics.output_send_to_device_event", string(config.Kafka.Topics.OutputSendToDeviceEvent))
+	checkNotEmpty(configErrs, "kafka.topics.output_key_change_event", string(config.Kafka.Topics.OutputKeyChangeEvent))
 }
 
 // checkDatabase verifies the parameters database.* are valid.
@@ -602,6 +618,7 @@ func (config *Dendrite) checkDatabase(configErrs *configErrors) {
 	checkNotEmpty(configErrs, "database.sync_api", string(config.Database.SyncAPI))
 	checkNotEmpty(configErrs, "database.room_server", string(config.Database.RoomServer))
 	checkNotEmpty(configErrs, "database.current_state", string(config.Database.CurrentState))
+	checkNotEmpty(configErrs, "database.e2e_key", string(config.Database.E2EKey))
 }
 
 // checkListen verifies the parameters listen.* are valid.
@@ -615,6 +632,7 @@ func (config *Dendrite) checkListen(configErrs *configErrors) {
 	checkNotEmpty(configErrs, "listen.server_key_api", string(config.Listen.EDUServer))
 	checkNotEmpty(configErrs, "listen.user_api", string(config.Listen.UserAPI))
 	checkNotEmpty(configErrs, "listen.current_state_server", string(config.Listen.CurrentState))
+	checkNotEmpty(configErrs, "listen.key_server", string(config.Listen.KeyServer))
 }
 
 // checkLogging verifies the parameters logging.* are valid.
