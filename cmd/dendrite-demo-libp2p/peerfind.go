@@ -148,21 +148,12 @@ func findPeer(ctx context.Context, host host.Host,
 		if p.ID == host.ID() {
 			continue
 		}
-		logger.Debug("Found peer:", p)
 
-		logger.Debug("Connecting to:", p)
+		// logger.Debug("Found peer:", p)
+		//fmt.Println("Found peer:", p)
 
-		// stream, err := host.NewStream(ctx, peer.ID, protocol.ID(config.ProtocolID))
-
-		// if err != nil {
-		// 	logger.Warning("Connection failed:", err)
-		// 	continue
-		// } else {
-		// 	rw := bufio.NewReadWriter(bufio.NewReader(stream), bufio.NewWriter(stream))
-
-		// 	// go writeData(rw)
-		// 	// go readData(rw)
-		// }
+		// logger.Debug("Connecting to:", p)
+		//fmt.Println("Connecting to:", p)
 
 		if err := host.Connect(context.Background(), p); err != nil {
 			fmt.Println("Error adding peer", p.ID.String(), "via DHT:", err)
@@ -188,7 +179,8 @@ func findPeer(ctx context.Context, host host.Host,
 			}
 		}
 
-		logger.Info("Connected to:", p)
+		// logger.Info("Connected to:", p)
+		fmt.Println("Connected to:", p)
 	}
 
 	fmt.Println("Discovered", len(host.Peerstore().Peers())-1, "other libp2p peer(s):")
