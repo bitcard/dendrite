@@ -155,7 +155,7 @@ func Setup(
 			if err != nil {
 				return util.ErrorResponse(err)
 			}
-			return SendKick(req, accountDB, device, vars["roomID"], cfg, rsAPI, asAPI)
+			return SendKick(req, accountDB, device, vars["roomID"], cfg, rsAPI, asAPI, stateAPI)
 		}),
 	).Methods(http.MethodPost, http.MethodOptions)
 	r0mux.Handle("/rooms/{roomID}/unban",
@@ -216,7 +216,7 @@ func Setup(
 			eventType = eventType[:len(eventType)-1]
 		}
 		eventFormat := req.URL.Query().Get("format") == "event"
-		return OnIncomingStateTypeRequest(req.Context(), rsAPI, vars["roomID"], eventType, "", eventFormat)
+		return OnIncomingStateTypeRequest(req.Context(), device, rsAPI, vars["roomID"], eventType, "", eventFormat)
 	})).Methods(http.MethodGet, http.MethodOptions)
 
 	r0mux.Handle("/rooms/{roomID}/state/{type}/{stateKey}", httputil.MakeAuthAPI("room_state", userAPI, func(req *http.Request, device *userapi.Device) util.JSONResponse {
@@ -225,7 +225,7 @@ func Setup(
 			return util.ErrorResponse(err)
 		}
 		eventFormat := req.URL.Query().Get("format") == "event"
-		return OnIncomingStateTypeRequest(req.Context(), rsAPI, vars["roomID"], vars["type"], vars["stateKey"], eventFormat)
+		return OnIncomingStateTypeRequest(req.Context(), device, rsAPI, vars["roomID"], vars["type"], vars["stateKey"], eventFormat)
 	})).Methods(http.MethodGet, http.MethodOptions)
 
 	r0mux.Handle("/rooms/{roomID}/state/{eventType:[^/]+/?}",
@@ -573,6 +573,27 @@ func Setup(
 			return GetAccountData(req, userAPI, device, vars["userID"], vars["roomID"], vars["type"])
 		}),
 	).Methods(http.MethodGet)
+
+	r0mux.Handle("/user_directory/search",
+		httputil.MakeAuthAPI("userdirectory_search", userAPI, func(req *http.Request, device *userapi.Device) util.JSONResponse {
+			postContent := struct {
+				SearchString string `json:"search_term"`
+				Limit        int    `json:"limit"`
+			}{}
+			if err := json.NewDecoder(req.Body).Decode(&postContent); err != nil {
+				return util.ErrorResponse(err)
+			}
+			return *SearchUserDirectory(
+				req.Context(),
+				device,
+				userAPI,
+				stateAPI,
+				cfg.Matrix.ServerName,
+				postContent.SearchString,
+				postContent.Limit,
+			)
+		}),
+	).Methods(http.MethodPost, http.MethodOptions)
 
 	r0mux.Handle("/rooms/{roomID}/members",
 		httputil.MakeAuthAPI("rooms_members", userAPI, func(req *http.Request, device *userapi.Device) util.JSONResponse {
