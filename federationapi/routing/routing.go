@@ -31,12 +31,6 @@ import (
 	"github.com/matrix-org/util"
 )
 
-const (
-	pathPrefixV2Keys       = "/key/v2"
-	pathPrefixV1Federation = "/federation/v1"
-	pathPrefixV2Federation = "/federation/v2"
-)
-
 // Setup registers HTTP handlers with the given ServeMux.
 // The provided publicAPIMux MUST have `UseEncodedPath()` enabled or else routes will incorrectly
 // path unescape twice (once from the router, once from MakeFedAPI). We need to have this enabled
@@ -46,8 +40,8 @@ const (
 // applied:
 // nolint: gocyclo
 func Setup(
-	publicAPIMux *mux.Router,
-	cfg *config.Dendrite,
+	fedMux, keyMux *mux.Router,
+	cfg *config.FederationAPI,
 	rsAPI roomserverAPI.RoomserverInternalAPI,
 	eduAPI eduserverAPI.EDUServerInputAPI,
 	fsAPI federationSenderAPI.FederationSenderInternalAPI,
@@ -57,9 +51,9 @@ func Setup(
 	stateAPI currentstateAPI.CurrentStateInternalAPI,
 	keyAPI keyserverAPI.KeyInternalAPI,
 ) {
-	v2keysmux := publicAPIMux.PathPrefix(pathPrefixV2Keys).Subrouter()
-	v1fedmux := publicAPIMux.PathPrefix(pathPrefixV1Federation).Subrouter()
-	v2fedmux := publicAPIMux.PathPrefix(pathPrefixV2Federation).Subrouter()
+	v2keysmux := keyMux.PathPrefix("/v2").Subrouter()
+	v1fedmux := fedMux.PathPrefix("/v1").Subrouter()
+	v2fedmux := fedMux.PathPrefix("/v2").Subrouter()
 
 	wakeup := &httputil.FederationWakeups{
 		FsAPI: fsAPI,
@@ -82,7 +76,7 @@ func Setup(
 		func(httpReq *http.Request, request *gomatrixserverlib.FederationRequest, vars map[string]string) util.JSONResponse {
 			return Send(
 				httpReq, request, gomatrixserverlib.TransactionID(vars["txnID"]),
-				cfg, rsAPI, eduAPI, keys, federation,
+				cfg, rsAPI, eduAPI, keyAPI, stateAPI, keys, federation,
 			)
 		},
 	)).Methods(http.MethodPut, http.MethodOptions)
@@ -90,6 +84,12 @@ func Setup(
 	v1fedmux.Handle("/invite/{roomID}/{eventID}", httputil.MakeFedAPI(
 		"federation_invite", cfg.Matrix.ServerName, keys, wakeup,
 		func(httpReq *http.Request, request *gomatrixserverlib.FederationRequest, vars map[string]string) util.JSONResponse {
+			if currentstateAPI.IsServerBannedFromRoom(httpReq.Context(), stateAPI, vars["roomID"], request.Origin()) {
+				return util.JSONResponse{
+					Code: http.StatusForbidden,
+					JSON: jsonerror.Forbidden("Forbidden by server ACLs"),
+				}
+			}
 			res := InviteV1(
 				httpReq, request, vars["roomID"], vars["eventID"],
 				cfg, rsAPI, keys,
@@ -106,6 +106,12 @@ func Setup(
 	v2fedmux.Handle("/invite/{roomID}/{eventID}", httputil.MakeFedAPI(
 		"federation_invite", cfg.Matrix.ServerName, keys, wakeup,
 		func(httpReq *http.Request, request *gomatrixserverlib.FederationRequest, vars map[string]string) util.JSONResponse {
+			if currentstateAPI.IsServerBannedFromRoom(httpReq.Context(), stateAPI, vars["roomID"], request.Origin()) {
+				return util.JSONResponse{
+					Code: http.StatusForbidden,
+					JSON: jsonerror.Forbidden("Forbidden by server ACLs"),
+				}
+			}
 			return InviteV2(
 				httpReq, request, vars["roomID"], vars["eventID"],
 				cfg, rsAPI, keys,
@@ -140,6 +146,12 @@ func Setup(
 	v1fedmux.Handle("/state/{roomID}", httputil.MakeFedAPI(
 		"federation_get_state", cfg.Matrix.ServerName, keys, wakeup,
 		func(httpReq *http.Request, request *gomatrixserverlib.FederationRequest, vars map[string]string) util.JSONResponse {
+			if currentstateAPI.IsServerBannedFromRoom(httpReq.Context(), stateAPI, vars["roomID"], request.Origin()) {
+				return util.JSONResponse{
+					Code: http.StatusForbidden,
+					JSON: jsonerror.Forbidden("Forbidden by server ACLs"),
+				}
+			}
 			return GetState(
 				httpReq.Context(), request, rsAPI, vars["roomID"],
 			)
@@ -149,6 +161,12 @@ func Setup(
 	v1fedmux.Handle("/state_ids/{roomID}", httputil.MakeFedAPI(
 		"federation_get_state_ids", cfg.Matrix.ServerName, keys, wakeup,
 		func(httpReq *http.Request, request *gomatrixserverlib.FederationRequest, vars map[string]string) util.JSONResponse {
+			if currentstateAPI.IsServerBannedFromRoom(httpReq.Context(), stateAPI, vars["roomID"], request.Origin()) {
+				return util.JSONResponse{
+					Code: http.StatusForbidden,
+					JSON: jsonerror.Forbidden("Forbidden by server ACLs"),
+				}
+			}
 			return GetStateIDs(
 				httpReq.Context(), request, rsAPI, vars["roomID"],
 			)
@@ -158,6 +176,12 @@ func Setup(
 	v1fedmux.Handle("/event_auth/{roomID}/{eventID}", httputil.MakeFedAPI(
 		"federation_get_event_auth", cfg.Matrix.ServerName, keys, wakeup,
 		func(httpReq *http.Request, request *gomatrixserverlib.FederationRequest, vars map[string]string) util.JSONResponse {
+			if currentstateAPI.IsServerBannedFromRoom(httpReq.Context(), stateAPI, vars["roomID"], request.Origin()) {
+				return util.JSONResponse{
+					Code: http.StatusForbidden,
+					JSON: jsonerror.Forbidden("Forbidden by server ACLs"),
+				}
+			}
 			return GetEventAuth(
 				httpReq.Context(), request, rsAPI, vars["roomID"], vars["eventID"],
 			)
@@ -186,7 +210,7 @@ func Setup(
 		"federation_user_devices", cfg.Matrix.ServerName, keys, wakeup,
 		func(httpReq *http.Request, request *gomatrixserverlib.FederationRequest, vars map[string]string) util.JSONResponse {
 			return GetUserDevices(
-				httpReq, userAPI, vars["userID"],
+				httpReq, keyAPI, vars["userID"],
 			)
 		},
 	)).Methods(http.MethodGet)
@@ -194,6 +218,12 @@ func Setup(
 	v1fedmux.Handle("/make_join/{roomID}/{eventID}", httputil.MakeFedAPI(
 		"federation_make_join", cfg.Matrix.ServerName, keys, wakeup,
 		func(httpReq *http.Request, request *gomatrixserverlib.FederationRequest, vars map[string]string) util.JSONResponse {
+			if currentstateAPI.IsServerBannedFromRoom(httpReq.Context(), stateAPI, vars["roomID"], request.Origin()) {
+				return util.JSONResponse{
+					Code: http.StatusForbidden,
+					JSON: jsonerror.Forbidden("Forbidden by server ACLs"),
+				}
+			}
 			roomID := vars["roomID"]
 			eventID := vars["eventID"]
 			queryVars := httpReq.URL.Query()
@@ -219,6 +249,12 @@ func Setup(
 	v1fedmux.Handle("/send_join/{roomID}/{eventID}", httputil.MakeFedAPI(
 		"federation_send_join", cfg.Matrix.ServerName, keys, wakeup,
 		func(httpReq *http.Request, request *gomatrixserverlib.FederationRequest, vars map[string]string) util.JSONResponse {
+			if currentstateAPI.IsServerBannedFromRoom(httpReq.Context(), stateAPI, vars["roomID"], request.Origin()) {
+				return util.JSONResponse{
+					Code: http.StatusForbidden,
+					JSON: jsonerror.Forbidden("Forbidden by server ACLs"),
+				}
+			}
 			roomID := vars["roomID"]
 			eventID := vars["eventID"]
 			res := SendJoin(
@@ -245,6 +281,12 @@ func Setup(
 	v2fedmux.Handle("/send_join/{roomID}/{eventID}", httputil.MakeFedAPI(
 		"federation_send_join", cfg.Matrix.ServerName, keys, wakeup,
 		func(httpReq *http.Request, request *gomatrixserverlib.FederationRequest, vars map[string]string) util.JSONResponse {
+			if currentstateAPI.IsServerBannedFromRoom(httpReq.Context(), stateAPI, vars["roomID"], request.Origin()) {
+				return util.JSONResponse{
+					Code: http.StatusForbidden,
+					JSON: jsonerror.Forbidden("Forbidden by server ACLs"),
+				}
+			}
 			roomID := vars["roomID"]
 			eventID := vars["eventID"]
 			return SendJoin(
@@ -256,6 +298,12 @@ func Setup(
 	v1fedmux.Handle("/make_leave/{roomID}/{eventID}", httputil.MakeFedAPI(
 		"federation_make_leave", cfg.Matrix.ServerName, keys, wakeup,
 		func(httpReq *http.Request, request *gomatrixserverlib.FederationRequest, vars map[string]string) util.JSONResponse {
+			if currentstateAPI.IsServerBannedFromRoom(httpReq.Context(), stateAPI, vars["roomID"], request.Origin()) {
+				return util.JSONResponse{
+					Code: http.StatusForbidden,
+					JSON: jsonerror.Forbidden("Forbidden by server ACLs"),
+				}
+			}
 			roomID := vars["roomID"]
 			eventID := vars["eventID"]
 			return MakeLeave(
@@ -264,9 +312,47 @@ func Setup(
 		},
 	)).Methods(http.MethodGet)
 
+	v1fedmux.Handle("/send_leave/{roomID}/{eventID}", httputil.MakeFedAPI(
+		"federation_send_leave", cfg.Matrix.ServerName, keys, wakeup,
+		func(httpReq *http.Request, request *gomatrixserverlib.FederationRequest, vars map[string]string) util.JSONResponse {
+			if currentstateAPI.IsServerBannedFromRoom(httpReq.Context(), stateAPI, vars["roomID"], request.Origin()) {
+				return util.JSONResponse{
+					Code: http.StatusForbidden,
+					JSON: jsonerror.Forbidden("Forbidden by server ACLs"),
+				}
+			}
+			roomID := vars["roomID"]
+			eventID := vars["eventID"]
+			res := SendLeave(
+				httpReq, request, cfg, rsAPI, keys, roomID, eventID,
+			)
+			// not all responses get wrapped in [code, body]
+			var body interface{}
+			body = []interface{}{
+				res.Code, res.JSON,
+			}
+			jerr, ok := res.JSON.(*jsonerror.MatrixError)
+			if ok {
+				body = jerr
+			}
+
+			return util.JSONResponse{
+				Headers: res.Headers,
+				Code:    res.Code,
+				JSON:    body,
+			}
+		},
+	)).Methods(http.MethodPut)
+
 	v2fedmux.Handle("/send_leave/{roomID}/{eventID}", httputil.MakeFedAPI(
 		"federation_send_leave", cfg.Matrix.ServerName, keys, wakeup,
 		func(httpReq *http.Request, request *gomatrixserverlib.FederationRequest, vars map[string]string) util.JSONResponse {
+			if currentstateAPI.IsServerBannedFromRoom(httpReq.Context(), stateAPI, vars["roomID"], request.Origin()) {
+				return util.JSONResponse{
+					Code: http.StatusForbidden,
+					JSON: jsonerror.Forbidden("Forbidden by server ACLs"),
+				}
+			}
 			roomID := vars["roomID"]
 			eventID := vars["eventID"]
 			return SendLeave(
@@ -285,6 +371,12 @@ func Setup(
 	v1fedmux.Handle("/get_missing_events/{roomID}", httputil.MakeFedAPI(
 		"federation_get_missing_events", cfg.Matrix.ServerName, keys, wakeup,
 		func(httpReq *http.Request, request *gomatrixserverlib.FederationRequest, vars map[string]string) util.JSONResponse {
+			if currentstateAPI.IsServerBannedFromRoom(httpReq.Context(), stateAPI, vars["roomID"], request.Origin()) {
+				return util.JSONResponse{
+					Code: http.StatusForbidden,
+					JSON: jsonerror.Forbidden("Forbidden by server ACLs"),
+				}
+			}
 			return GetMissingEvents(httpReq, request, rsAPI, vars["roomID"])
 		},
 	)).Methods(http.MethodPost)
@@ -292,6 +384,12 @@ func Setup(
 	v1fedmux.Handle("/backfill/{roomID}", httputil.MakeFedAPI(
 		"federation_backfill", cfg.Matrix.ServerName, keys, wakeup,
 		func(httpReq *http.Request, request *gomatrixserverlib.FederationRequest, vars map[string]string) util.JSONResponse {
+			if currentstateAPI.IsServerBannedFromRoom(httpReq.Context(), stateAPI, vars["roomID"], request.Origin()) {
+				return util.JSONResponse{
+					Code: http.StatusForbidden,
+					JSON: jsonerror.Forbidden("Forbidden by server ACLs"),
+				}
+			}
 			return Backfill(httpReq, request, rsAPI, vars["roomID"], cfg)
 		},
 	)).Methods(http.MethodGet)

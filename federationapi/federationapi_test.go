@@ -8,7 +8,6 @@ import (
 
 	"github.com/matrix-org/dendrite/federationapi"
 	"github.com/matrix-org/dendrite/internal/config"
-	"github.com/matrix-org/dendrite/internal/httputil"
 	"github.com/matrix-org/dendrite/internal/setup"
 	"github.com/matrix-org/dendrite/internal/test"
 	"github.com/matrix-org/gomatrix"
@@ -20,30 +19,24 @@ import (
 func TestRoomsV3URLEscapeDoNot404(t *testing.T) {
 	_, privKey, _ := ed25519.GenerateKey(nil)
 	cfg := &config.Dendrite{}
-	cfg.Matrix.KeyID = gomatrixserverlib.KeyID("ed25519:auto")
-	cfg.Matrix.ServerName = gomatrixserverlib.ServerName("localhost")
-	cfg.Matrix.PrivateKey = privKey
-	cfg.Kafka.UseNaffka = true
-	cfg.Database.Naffka = "file::memory:"
-	cfg.SetDefaults()
-	base := setup.NewBaseDendrite(cfg, "Test", false)
+	cfg.Defaults()
+	cfg.Global.KeyID = gomatrixserverlib.KeyID("ed25519:auto")
+	cfg.Global.ServerName = gomatrixserverlib.ServerName("localhost")
+	cfg.Global.PrivateKey = privKey
+	cfg.Global.Kafka.UseNaffka = true
+	cfg.Global.Kafka.Database.ConnectionString = config.DataSource("file::memory:")
+	cfg.FederationSender.Database.ConnectionString = config.DataSource("file::memory:")
+	base := setup.NewBaseDendrite(cfg, "Monolith", false)
 	keyRing := &test.NopJSONVerifier{}
 	fsAPI := base.FederationSenderHTTPClient()
 	// TODO: This is pretty fragile, as if anything calls anything on these nils this test will break.
 	// Unfortunately, it makes little sense to instantiate these dependencies when we just want to test routing.
-	federationapi.AddPublicRoutes(base.PublicAPIMux, cfg, nil, nil, keyRing, nil, fsAPI, nil, nil, nil)
-	httputil.SetupHTTPAPI(
-		base.BaseMux,
-		base.PublicAPIMux,
-		base.InternalAPIMux,
-		cfg,
-		base.UseHTTPAPIs,
-	)
-	baseURL, cancel := test.ListenAndServe(t, base.BaseMux, true)
+	federationapi.AddPublicRoutes(base.PublicFederationAPIMux, base.PublicKeyAPIMux, &cfg.FederationAPI, nil, nil, keyRing, nil, fsAPI, nil, nil, nil)
+	baseURL, cancel := test.ListenAndServe(t, base.PublicFederationAPIMux, true)
 	defer cancel()
 	serverName := gomatrixserverlib.ServerName(strings.TrimPrefix(baseURL, "https://"))
 
-	fedCli := gomatrixserverlib.NewFederationClient(serverName, cfg.Matrix.KeyID, cfg.Matrix.PrivateKey)
+	fedCli := gomatrixserverlib.NewFederationClient(serverName, cfg.Global.KeyID, cfg.Global.PrivateKey, true)
 
 	testCases := []struct {
 		roomVer   gomatrixserverlib.RoomVersion

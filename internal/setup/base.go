@@ -15,7 +15,6 @@
 package setup
 
 import (
-	"database/sql"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,6 +27,7 @@ import (
 	"github.com/matrix-org/dendrite/internal/sqlutil"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/naffka"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/matrix-org/dendrite/internal"
 	"github.com/matrix-org/dendrite/userapi/storage/accounts"
@@ -63,28 +63,39 @@ import (
 // should only be used during start up.
 // Must be closed when shutting down.
 type BaseDendrite struct {
-	componentName string
-	tracerCloser  io.Closer
-
-	// PublicAPIMux should be used to register new public matrix api endpoints
-	PublicAPIMux   *mux.Router
-	InternalAPIMux *mux.Router
-	BaseMux        *mux.Router // base router which created public/internal subrouters
-	UseHTTPAPIs    bool
-	httpClient     *http.Client
-	Cfg            *config.Dendrite
-	Caches         *caching.Caches
-	KafkaConsumer  sarama.Consumer
-	KafkaProducer  sarama.SyncProducer
+	componentName          string
+	tracerCloser           io.Closer
+	PublicClientAPIMux     *mux.Router
+	PublicFederationAPIMux *mux.Router
+	PublicKeyAPIMux        *mux.Router
+	PublicMediaAPIMux      *mux.Router
+	InternalAPIMux         *mux.Router
+	UseHTTPAPIs            bool
+	httpClient             *http.Client
+	Cfg                    *config.Dendrite
+	Caches                 *caching.Caches
+	KafkaConsumer          sarama.Consumer
+	KafkaProducer          sarama.SyncProducer
 }
 
 const HTTPServerTimeout = time.Minute * 5
 const HTTPClientTimeout = time.Second * 30
 
+const NoExternalListener = ""
+
 // NewBaseDendrite creates a new instance to be used by a component.
 // The componentName is used for logging purposes, and should be a friendly name
 // of the compontent running, e.g. "SyncAPI"
 func NewBaseDendrite(cfg *config.Dendrite, componentName string, useHTTPAPIs bool) *BaseDendrite {
+	configErrors := &config.ConfigErrors{}
+	cfg.Verify(configErrors, componentName == "Monolith") // TODO: better way?
+	if len(*configErrors) > 0 {
+		for _, err := range *configErrors {
+			logrus.Errorf("Configuration error: %s", err)
+		}
+		logrus.Fatalf("Failed to start due to configuration errors")
+	}
+
 	internal.SetupStdLogging()
 	internal.SetupHookLogging(cfg.Logging, componentName)
 	internal.SetupPprof()
@@ -96,7 +107,7 @@ func NewBaseDendrite(cfg *config.Dendrite, componentName string, useHTTPAPIs boo
 
 	var kafkaConsumer sarama.Consumer
 	var kafkaProducer sarama.SyncProducer
-	if cfg.Kafka.UseNaffka {
+	if cfg.Global.Kafka.UseNaffka {
 		kafkaConsumer, kafkaProducer = setupNaffka(cfg)
 	} else {
 		kafkaConsumer, kafkaProducer = setupKafka(cfg)
@@ -108,10 +119,10 @@ func NewBaseDendrite(cfg *config.Dendrite, componentName string, useHTTPAPIs boo
 	}
 
 	client := http.Client{Timeout: HTTPClientTimeout}
-	if cfg.Proxy != nil {
+	if cfg.FederationSender.Proxy.Enabled {
 		client.Transport = &http.Transport{Proxy: http.ProxyURL(&url.URL{
-			Scheme: cfg.Proxy.Protocol,
-			Host:   fmt.Sprintf("%s:%d", cfg.Proxy.Host, cfg.Proxy.Port),
+			Scheme: cfg.FederationSender.Proxy.Protocol,
+			Host:   fmt.Sprintf("%s:%d", cfg.FederationSender.Proxy.Host, cfg.FederationSender.Proxy.Port),
 		})}
 	}
 
@@ -126,20 +137,20 @@ func NewBaseDendrite(cfg *config.Dendrite, componentName string, useHTTPAPIs boo
 	// We need to be careful with media APIs if they read from a filesystem to make sure they
 	// are not inadvertently reading paths without cleaning, else this could introduce a
 	// directory traversal attack e.g /../../../etc/passwd
-	httpmux := mux.NewRouter().SkipClean(true)
-
 	return &BaseDendrite{
-		componentName:  componentName,
-		UseHTTPAPIs:    useHTTPAPIs,
-		tracerCloser:   closer,
-		Cfg:            cfg,
-		Caches:         cache,
-		BaseMux:        httpmux,
-		PublicAPIMux:   httpmux.PathPrefix(httputil.PublicPathPrefix).Subrouter().UseEncodedPath(),
-		InternalAPIMux: httpmux.PathPrefix(httputil.InternalPathPrefix).Subrouter().UseEncodedPath(),
-		httpClient:     &client,
-		KafkaConsumer:  kafkaConsumer,
-		KafkaProducer:  kafkaProducer,
+		componentName:          componentName,
+		UseHTTPAPIs:            useHTTPAPIs,
+		tracerCloser:           closer,
+		Cfg:                    cfg,
+		Caches:                 cache,
+		PublicClientAPIMux:     mux.NewRouter().SkipClean(true).PathPrefix(httputil.PublicClientPathPrefix).Subrouter().UseEncodedPath(),
+		PublicFederationAPIMux: mux.NewRouter().SkipClean(true).PathPrefix(httputil.PublicFederationPathPrefix).Subrouter().UseEncodedPath(),
+		PublicKeyAPIMux:        mux.NewRouter().SkipClean(true).PathPrefix(httputil.PublicKeyPathPrefix).Subrouter().UseEncodedPath(),
+		PublicMediaAPIMux:      mux.NewRouter().SkipClean(true).PathPrefix(httputil.PublicMediaPathPrefix).Subrouter().UseEncodedPath(),
+		InternalAPIMux:         mux.NewRouter().SkipClean(true).PathPrefix(httputil.InternalPathPrefix).Subrouter().UseEncodedPath(),
+		httpClient:             &client,
+		KafkaConsumer:          kafkaConsumer,
+		KafkaProducer:          kafkaProducer,
 	}
 }
 
@@ -228,7 +239,7 @@ func (b *BaseDendrite) KeyServerHTTPClient() keyserverAPI.KeyInternalAPI {
 // CreateDeviceDB creates a new instance of the device database. Should only be
 // called once per component.
 func (b *BaseDendrite) CreateDeviceDB() devices.Database {
-	db, err := devices.NewDatabase(string(b.Cfg.Database.Device), b.Cfg.DbProperties(), b.Cfg.Matrix.ServerName)
+	db, err := devices.NewDatabase(&b.Cfg.UserAPI.DeviceDatabase, b.Cfg.Global.ServerName)
 	if err != nil {
 		logrus.WithError(err).Panicf("failed to connect to devices db")
 	}
@@ -239,7 +250,7 @@ func (b *BaseDendrite) CreateDeviceDB() devices.Database {
 // CreateAccountsDB creates a new instance of the accounts database. Should only
 // be called once per component.
 func (b *BaseDendrite) CreateAccountsDB() accounts.Database {
-	db, err := accounts.NewDatabase(string(b.Cfg.Database.Account), b.Cfg.DbProperties(), b.Cfg.Matrix.ServerName)
+	db, err := accounts.NewDatabase(&b.Cfg.UserAPI.AccountDatabase, b.Cfg.Global.ServerName)
 	if err != nil {
 		logrus.WithError(err).Panicf("failed to connect to accounts db")
 	}
@@ -251,53 +262,91 @@ func (b *BaseDendrite) CreateAccountsDB() accounts.Database {
 // once per component.
 func (b *BaseDendrite) CreateFederationClient() *gomatrixserverlib.FederationClient {
 	return gomatrixserverlib.NewFederationClient(
-		b.Cfg.Matrix.ServerName, b.Cfg.Matrix.KeyID, b.Cfg.Matrix.PrivateKey,
+		b.Cfg.Global.ServerName, b.Cfg.Global.KeyID, b.Cfg.Global.PrivateKey,
+		b.Cfg.FederationSender.DisableTLSValidation,
 	)
 }
 
 // SetupAndServeHTTP sets up the HTTP server to serve endpoints registered on
 // ApiMux under /api/ and adds a prometheus handler under /metrics.
-func (b *BaseDendrite) SetupAndServeHTTP(bindaddr string, listenaddr string) {
-	// If a separate bind address is defined, listen on that. Otherwise use
-	// the listen address
-	var addr string
-	if bindaddr != "" {
-		addr = bindaddr
-	} else {
-		addr = listenaddr
-	}
+// nolint:gocyclo
+func (b *BaseDendrite) SetupAndServeHTTP(
+	internalHTTPAddr, externalHTTPAddr config.HTTPAddress,
+	certFile, keyFile *string,
+) {
+	internalAddr, _ := internalHTTPAddr.Address()
+	externalAddr, _ := externalHTTPAddr.Address()
 
-	serv := http.Server{
-		Addr:         addr,
+	internalRouter := mux.NewRouter()
+	externalRouter := internalRouter
+
+	internalServ := &http.Server{
+		Addr:         string(internalAddr),
 		WriteTimeout: HTTPServerTimeout,
+		Handler:      internalRouter,
+	}
+	externalServ := internalServ
+
+	if externalAddr != NoExternalListener && externalAddr != internalAddr {
+		externalRouter = mux.NewRouter()
+		externalServ = &http.Server{
+			Addr:         string(externalAddr),
+			WriteTimeout: HTTPServerTimeout,
+			Handler:      externalRouter,
+		}
 	}
 
-	httputil.SetupHTTPAPI(
-		b.BaseMux,
-		b.PublicAPIMux,
-		b.InternalAPIMux,
-		b.Cfg,
-		b.UseHTTPAPIs,
-	)
-	serv.Handler = b.BaseMux
-	logrus.Infof("Starting %s server on %s", b.componentName, serv.Addr)
-
-	err := serv.ListenAndServe()
-	if err != nil {
-		logrus.WithError(err).Fatal("failed to serve http")
+	internalRouter.PathPrefix(httputil.InternalPathPrefix).Handler(b.InternalAPIMux)
+	if b.Cfg.Global.Metrics.Enabled {
+		internalRouter.Handle("/metrics", httputil.WrapHandlerInBasicAuth(promhttp.Handler(), b.Cfg.Global.Metrics.BasicAuth))
 	}
 
-	logrus.Infof("Stopped %s server on %s", b.componentName, serv.Addr)
+	externalRouter.PathPrefix(httputil.PublicClientPathPrefix).Handler(b.PublicClientAPIMux)
+	externalRouter.PathPrefix(httputil.PublicKeyPathPrefix).Handler(b.PublicKeyAPIMux)
+	externalRouter.PathPrefix(httputil.PublicFederationPathPrefix).Handler(b.PublicFederationAPIMux)
+	externalRouter.PathPrefix(httputil.PublicMediaPathPrefix).Handler(b.PublicMediaAPIMux)
+
+	go func() {
+		logrus.Infof("Starting %s listener on %s", b.componentName, internalServ.Addr)
+		if certFile != nil && keyFile != nil {
+			if err := internalServ.ListenAndServeTLS(*certFile, *keyFile); err != nil {
+				logrus.WithError(err).Fatal("failed to serve HTTPS")
+			}
+		} else {
+			if err := internalServ.ListenAndServe(); err != nil {
+				logrus.WithError(err).Fatal("failed to serve HTTP")
+			}
+		}
+		logrus.Infof("Stopped %s listener on %s", b.componentName, internalServ.Addr)
+	}()
+
+	if externalAddr != NoExternalListener && internalAddr != externalAddr {
+		go func() {
+			logrus.Infof("Starting %s listener on %s", b.componentName, externalServ.Addr)
+			if certFile != nil && keyFile != nil {
+				if err := externalServ.ListenAndServeTLS(*certFile, *keyFile); err != nil {
+					logrus.WithError(err).Fatal("failed to serve HTTPS")
+				}
+			} else {
+				if err := externalServ.ListenAndServe(); err != nil {
+					logrus.WithError(err).Fatal("failed to serve HTTP")
+				}
+			}
+			logrus.Infof("Stopped %s listener on %s", b.componentName, externalServ.Addr)
+		}()
+	}
+
+	select {}
 }
 
 // setupKafka creates kafka consumer/producer pair from the config.
 func setupKafka(cfg *config.Dendrite) (sarama.Consumer, sarama.SyncProducer) {
-	consumer, err := sarama.NewConsumer(cfg.Kafka.Addresses, nil)
+	consumer, err := sarama.NewConsumer(cfg.Global.Kafka.Addresses, nil)
 	if err != nil {
 		logrus.WithError(err).Panic("failed to start kafka consumer")
 	}
 
-	producer, err := sarama.NewSyncProducer(cfg.Kafka.Addresses, nil)
+	producer, err := sarama.NewSyncProducer(cfg.Global.Kafka.Addresses, nil)
 	if err != nil {
 		logrus.WithError(err).Panic("failed to setup kafka producers")
 	}
@@ -307,36 +356,26 @@ func setupKafka(cfg *config.Dendrite) (sarama.Consumer, sarama.SyncProducer) {
 
 // setupNaffka creates kafka consumer/producer pair from the config.
 func setupNaffka(cfg *config.Dendrite) (sarama.Consumer, sarama.SyncProducer) {
-	var err error
-	var db *sql.DB
 	var naffkaDB *naffka.DatabaseImpl
 
-	uri, err := url.Parse(string(cfg.Database.Naffka))
-	if err != nil || uri.Scheme == "file" {
-		var cs string
-		cs, err = sqlutil.ParseFileURI(string(cfg.Database.Naffka))
-		if err != nil {
-			logrus.WithError(err).Panic("Failed to parse naffka database file URI")
-		}
-		db, err = sqlutil.Open(sqlutil.SQLiteDriverName(), cs, nil)
-		if err != nil {
-			logrus.WithError(err).Panic("Failed to open naffka database")
-		}
+	db, err := sqlutil.Open(&cfg.Global.Kafka.Database)
+	if err != nil {
+		logrus.WithError(err).Panic("Failed to open naffka database")
+	}
 
+	switch {
+	case cfg.Global.Kafka.Database.ConnectionString.IsSQLite():
 		naffkaDB, err = naffka.NewSqliteDatabase(db)
 		if err != nil {
 			logrus.WithError(err).Panic("Failed to setup naffka database")
 		}
-	} else {
-		db, err = sqlutil.Open("postgres", string(cfg.Database.Naffka), nil)
-		if err != nil {
-			logrus.WithError(err).Panic("Failed to open naffka database")
-		}
-
+	case cfg.Global.Kafka.Database.ConnectionString.IsPostgres():
 		naffkaDB, err = naffka.NewPostgresqlDatabase(db)
 		if err != nil {
 			logrus.WithError(err).Panic("Failed to setup naffka database")
 		}
+	default:
+		panic("unknown naffka database type")
 	}
 
 	if naffkaDB == nil {

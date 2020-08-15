@@ -35,19 +35,21 @@ type OutputRoomEventConsumer struct {
 	rsConsumer *internal.ContinualConsumer
 	db         storage.Database
 	notifier   *sync.Notifier
+	keyChanges *OutputKeyChangeEventConsumer
 }
 
 // NewOutputRoomEventConsumer creates a new OutputRoomEventConsumer. Call Start() to begin consuming from room servers.
 func NewOutputRoomEventConsumer(
-	cfg *config.Dendrite,
+	cfg *config.SyncAPI,
 	kafkaConsumer sarama.Consumer,
 	n *sync.Notifier,
 	store storage.Database,
 	rsAPI api.RoomserverInternalAPI,
+	keyChanges *OutputKeyChangeEventConsumer,
 ) *OutputRoomEventConsumer {
 
 	consumer := internal.ContinualConsumer{
-		Topic:          string(cfg.Kafka.Topics.OutputRoomEvent),
+		Topic:          string(cfg.Matrix.Kafka.TopicFor(config.TopicOutputRoomEvent)),
 		Consumer:       kafkaConsumer,
 		PartitionStore: store,
 	}
@@ -56,6 +58,7 @@ func NewOutputRoomEventConsumer(
 		db:         store,
 		notifier:   n,
 		rsAPI:      rsAPI,
+		keyChanges: keyChanges,
 	}
 	consumer.ProcessMessage = s.onMessage
 
@@ -158,9 +161,29 @@ func (s *OutputRoomEventConsumer) onNewRoomEvent(
 		}).Panicf("roomserver output log: write event failure")
 		return nil
 	}
-	s.notifier.OnNewEvent(&ev, "", nil, types.NewStreamToken(pduPos, 0))
+	s.notifier.OnNewEvent(&ev, "", nil, types.NewStreamToken(pduPos, 0, nil))
+
+	s.notifyKeyChanges(&ev)
 
 	return nil
+}
+
+func (s *OutputRoomEventConsumer) notifyKeyChanges(ev *gomatrixserverlib.HeaderedEvent) {
+	if ev.Type() != gomatrixserverlib.MRoomMember || ev.StateKey() == nil {
+		return
+	}
+	membership, err := ev.Membership()
+	if err != nil {
+		return
+	}
+	switch membership {
+	case gomatrixserverlib.Join:
+		s.keyChanges.OnJoinEvent(ev)
+	case gomatrixserverlib.Ban:
+		fallthrough
+	case gomatrixserverlib.Leave:
+		s.keyChanges.OnLeaveEvent(ev)
+	}
 }
 
 func (s *OutputRoomEventConsumer) onNewInviteEvent(
@@ -176,7 +199,7 @@ func (s *OutputRoomEventConsumer) onNewInviteEvent(
 		}).Panicf("roomserver output log: write invite failure")
 		return nil
 	}
-	s.notifier.OnNewEvent(&msg.Event, "", nil, types.NewStreamToken(pduPos, 0))
+	s.notifier.OnNewEvent(&msg.Event, "", nil, types.NewStreamToken(pduPos, 0, nil))
 	return nil
 }
 
@@ -194,7 +217,7 @@ func (s *OutputRoomEventConsumer) onRetireInviteEvent(
 	}
 	// Notify any active sync requests that the invite has been retired.
 	// Invites share the same stream counter as PDUs
-	s.notifier.OnNewEvent(nil, "", []string{msg.TargetUserID}, types.NewStreamToken(sp, 0))
+	s.notifier.OnNewEvent(nil, "", []string{msg.TargetUserID}, types.NewStreamToken(sp, 0, nil))
 	return nil
 }
 

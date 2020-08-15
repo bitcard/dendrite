@@ -19,14 +19,23 @@ import (
 	"encoding/json"
 	"strings"
 	"time"
+
+	userapi "github.com/matrix-org/dendrite/userapi/api"
+	"github.com/matrix-org/gomatrixserverlib"
 )
 
 type KeyInternalAPI interface {
+	// SetUserAPI assigns a user API to query when extracting device names.
+	SetUserAPI(i userapi.UserInternalAPI)
+	// InputDeviceListUpdate from a federated server EDU
+	InputDeviceListUpdate(ctx context.Context, req *InputDeviceListUpdateRequest, res *InputDeviceListUpdateResponse)
 	PerformUploadKeys(ctx context.Context, req *PerformUploadKeysRequest, res *PerformUploadKeysResponse)
 	// PerformClaimKeys claims one-time keys for use in pre-key messages
 	PerformClaimKeys(ctx context.Context, req *PerformClaimKeysRequest, res *PerformClaimKeysResponse)
 	QueryKeys(ctx context.Context, req *QueryKeysRequest, res *QueryKeysResponse)
 	QueryKeyChanges(ctx context.Context, req *QueryKeyChangesRequest, res *QueryKeyChangesResponse)
+	QueryOneTimeKeys(ctx context.Context, req *QueryOneTimeKeysRequest, res *QueryOneTimeKeysResponse)
+	QueryDeviceMessages(ctx context.Context, req *QueryDeviceMessagesRequest, res *QueryDeviceMessagesResponse)
 }
 
 // KeyError is returned if there was a problem performing/querying the server
@@ -38,6 +47,13 @@ func (k *KeyError) Error() string {
 	return k.Err
 }
 
+// DeviceMessage represents the message produced into Kafka by the key server.
+type DeviceMessage struct {
+	DeviceKeys
+	// A monotonically increasing number which represents device changes for this user.
+	StreamID int
+}
+
 // DeviceKeys represents a set of device keys for a single device
 // https://matrix.org/docs/spec/client_server/r0.6.1#post-matrix-client-r0-keys-upload
 type DeviceKeys struct {
@@ -45,8 +61,18 @@ type DeviceKeys struct {
 	UserID string
 	// The device ID of this device
 	DeviceID string
+	// The device display name
+	DisplayName string
 	// The raw device key JSON
 	KeyJSON []byte
+}
+
+// WithStreamID returns a copy of this device message with the given stream ID
+func (k *DeviceKeys) WithStreamID(streamID int) DeviceMessage {
+	return DeviceMessage{
+		DeviceKeys: *k,
+		StreamID:   streamID,
+	}
 }
 
 // OneTimeKeys represents a set of one-time keys for a single device
@@ -84,6 +110,11 @@ type OneTimeKeysCount struct {
 type PerformUploadKeysRequest struct {
 	DeviceKeys  []DeviceKeys
 	OneTimeKeys []OneTimeKeys
+	// OnlyDisplayNameUpdates should be `true` if ALL the DeviceKeys are present to update
+	// the display name for their respective device, and NOT to modify the keys. The key
+	// itself doesn't change but it's easier to pretend upload new keys and reuse the same code paths.
+	// Without this flag, requests to modify device display names would delete device keys.
+	OnlyDisplayNameUpdates bool
 }
 
 // PerformUploadKeysResponse is the response to PerformUploadKeys
@@ -138,13 +169,50 @@ type QueryKeyChangesRequest struct {
 	Partition int32
 	// The offset of the last received key event, or sarama.OffsetOldest if this is from the beginning
 	Offset int64
+	// The inclusive offset where to track key changes up to. Messages with this offset are included in the response.
+	// Use sarama.OffsetNewest if the offset is unknown (then check the response Offset to avoid racing).
+	ToOffset int64
 }
 
 type QueryKeyChangesResponse struct {
 	// The set of users who have had their keys change.
 	UserIDs []string
+	// The partition being served - useful if the partition is unknown at request time
+	Partition int32
 	// The latest offset represented in this response.
 	Offset int64
 	// Set if there was a problem handling the request.
+	Error *KeyError
+}
+
+type QueryOneTimeKeysRequest struct {
+	// The local user to query OTK counts for
+	UserID string
+	// The device to query OTK counts for
+	DeviceID string
+}
+
+type QueryOneTimeKeysResponse struct {
+	// OTK key counts, in the extended /sync form described by https://matrix.org/docs/spec/client_server/r0.6.1#id84
+	Count OneTimeKeysCount
+	Error *KeyError
+}
+
+type QueryDeviceMessagesRequest struct {
+	UserID string
+}
+
+type QueryDeviceMessagesResponse struct {
+	// The latest stream ID
+	StreamID int
+	Devices  []DeviceMessage
+	Error    *KeyError
+}
+
+type InputDeviceListUpdateRequest struct {
+	Event gomatrixserverlib.DeviceListUpdateEvent
+}
+
+type InputDeviceListUpdateResponse struct {
 	Error *KeyError
 }

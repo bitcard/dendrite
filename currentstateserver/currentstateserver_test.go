@@ -15,10 +15,13 @@
 package currentstateserver
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"os"
 	"reflect"
 	"testing"
 	"time"
@@ -26,7 +29,9 @@ import (
 	"github.com/Shopify/sarama"
 	"github.com/gorilla/mux"
 	"github.com/matrix-org/dendrite/currentstateserver/api"
+	"github.com/matrix-org/dendrite/currentstateserver/internal"
 	"github.com/matrix-org/dendrite/currentstateserver/inthttp"
+	"github.com/matrix-org/dendrite/currentstateserver/storage"
 	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/httputil"
 	"github.com/matrix-org/dendrite/internal/sqlutil"
@@ -52,7 +57,8 @@ var (
 	testEvents      = []gomatrixserverlib.HeaderedEvent{}
 	testStateEvents = make(map[gomatrixserverlib.StateKeyTuple]gomatrixserverlib.HeaderedEvent)
 
-	kafkaTopic = "room_events"
+	kafkaPrefix = "Dendrite"
+	kafkaTopic  = fmt.Sprintf("%s%s", kafkaPrefix, "OutputRoomEvent")
 )
 
 func init() {
@@ -72,7 +78,24 @@ func init() {
 	}
 }
 
-func MustWriteOutputEvent(t *testing.T, producer sarama.SyncProducer, out *roomserverAPI.OutputNewRoomEvent) error {
+func waitForOffsetProcessed(t *testing.T, db storage.Database, offset int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for {
+		poffsets, err := db.PartitionOffsets(ctx, kafkaTopic)
+		if err != nil {
+			t.Fatalf("failed to PartitionOffsets: %s", err)
+		}
+		for _, partition := range poffsets {
+			if partition.Offset >= offset {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func MustWriteOutputEvent(t *testing.T, producer sarama.SyncProducer, out *roomserverAPI.OutputNewRoomEvent) int64 {
 	value, err := json.Marshal(roomserverAPI.OutputEvent{
 		Type:         roomserverAPI.OutputTypeNewRoomEvent,
 		NewRoomEvent: out,
@@ -80,7 +103,7 @@ func MustWriteOutputEvent(t *testing.T, producer sarama.SyncProducer, out *rooms
 	if err != nil {
 		t.Fatalf("failed to marshal output event: %s", err)
 	}
-	_, _, err = producer.SendMessage(&sarama.ProducerMessage{
+	_, offset, err := producer.SendMessage(&sarama.ProducerMessage{
 		Topic: kafkaTopic,
 		Key:   sarama.StringEncoder(out.Event.RoomID()),
 		Value: sarama.ByteEncoder(value),
@@ -88,14 +111,20 @@ func MustWriteOutputEvent(t *testing.T, producer sarama.SyncProducer, out *rooms
 	if err != nil {
 		t.Fatalf("failed to send message: %s", err)
 	}
-	return nil
+	return offset
 }
 
-func MustMakeInternalAPI(t *testing.T) (api.CurrentStateInternalAPI, sarama.SyncProducer) {
+func MustMakeInternalAPI(t *testing.T) (api.CurrentStateInternalAPI, storage.Database, sarama.SyncProducer, func()) {
 	cfg := &config.Dendrite{}
-	cfg.Kafka.Topics.OutputRoomEvent = config.Topic(kafkaTopic)
-	cfg.Database.CurrentState = config.DataSource("file::memory:")
-	db, err := sqlutil.Open(sqlutil.SQLiteDriverName(), "file::memory:", nil)
+	cfg.Defaults()
+	stateDBName := "test_state.db"
+	naffkaDBName := "test_naffka.db"
+	cfg.Global.ServerName = "kaer.morhen"
+	cfg.CurrentStateServer.Database.ConnectionString = config.DataSource("file:" + stateDBName)
+	cfg.Global.Kafka.TopicPrefix = kafkaPrefix
+	db, err := sqlutil.Open(&config.DatabaseOptions{
+		ConnectionString: config.DataSource("file:" + naffkaDBName),
+	})
 	if err != nil {
 		t.Fatalf("Failed to open naffka database: %s", err)
 	}
@@ -107,22 +136,28 @@ func MustMakeInternalAPI(t *testing.T) (api.CurrentStateInternalAPI, sarama.Sync
 	if err != nil {
 		t.Fatalf("Failed to create naffka consumer: %s", err)
 	}
-	return NewInternalAPI(cfg, naff), naff
+	stateAPI := NewInternalAPI(&cfg.CurrentStateServer, naff)
+	// type-cast to pull out the DB
+	stateAPIVal := stateAPI.(*internal.CurrentStateInternalAPI)
+	return stateAPI, stateAPIVal.DB, naff, func() {
+		os.Remove(naffkaDBName)
+		os.Remove(stateDBName)
+	}
 }
 
 func TestQueryCurrentState(t *testing.T) {
-	currStateAPI, producer := MustMakeInternalAPI(t)
+	currStateAPI, db, producer, cancel := MustMakeInternalAPI(t)
+	defer cancel()
 	plTuple := gomatrixserverlib.StateKeyTuple{
 		EventType: "m.room.power_levels",
 		StateKey:  "",
 	}
 	plEvent := testEvents[4]
-	MustWriteOutputEvent(t, producer, &roomserverAPI.OutputNewRoomEvent{
+	offset := MustWriteOutputEvent(t, producer, &roomserverAPI.OutputNewRoomEvent{
 		Event:             plEvent,
 		AddsStateEventIDs: []string{plEvent.EventID()},
 	})
-	// we have no good way to know /when/ the server has consumed the event
-	time.Sleep(100 * time.Millisecond)
+	waitForOffsetProcessed(t, db, offset)
 
 	testCases := []struct {
 		req     api.QueryCurrentStateRequest
@@ -158,8 +193,13 @@ func TestQueryCurrentState(t *testing.T) {
 					t.Errorf("QueryCurrentState want tuple %+v but it is missing from the response", tuple)
 					continue
 				}
-				if !reflect.DeepEqual(gotEvent.JSON(), wantEvent.JSON()) {
-					t.Errorf("QueryCurrentState tuple %+v got event JSON %s want %s", tuple, string(gotEvent.JSON()), string(wantEvent.JSON()))
+				gotCanon, err := gomatrixserverlib.CanonicalJSON(gotEvent.JSON())
+				if err != nil {
+					t.Errorf("CanonicalJSON failed: %w", err)
+					continue
+				}
+				if !bytes.Equal(gotCanon, wantEvent.JSON()) {
+					t.Errorf("QueryCurrentState tuple %+v got event JSON %s want %s", tuple, string(gotCanon), string(wantEvent.JSON()))
 				}
 			}
 		}
@@ -209,7 +249,8 @@ func mustMakeMembershipEvent(t *testing.T, roomID, userID, membership string) *r
 
 // This test makes sure that QuerySharedUsers is returning the correct users for a range of sets.
 func TestQuerySharedUsers(t *testing.T) {
-	currStateAPI, producer := MustMakeInternalAPI(t)
+	currStateAPI, db, producer, cancel := MustMakeInternalAPI(t)
+	defer cancel()
 	MustWriteOutputEvent(t, producer, mustMakeMembershipEvent(t, "!foo:bar", "@alice:localhost", "join"))
 	MustWriteOutputEvent(t, producer, mustMakeMembershipEvent(t, "!foo:bar", "@bob:localhost", "join"))
 
@@ -220,7 +261,8 @@ func TestQuerySharedUsers(t *testing.T) {
 	MustWriteOutputEvent(t, producer, mustMakeMembershipEvent(t, "!foo3:bar", "@bob:localhost", "join"))
 	MustWriteOutputEvent(t, producer, mustMakeMembershipEvent(t, "!foo3:bar", "@dave:localhost", "leave"))
 
-	MustWriteOutputEvent(t, producer, mustMakeMembershipEvent(t, "!foo4:bar", "@alice:localhost", "join"))
+	offset := MustWriteOutputEvent(t, producer, mustMakeMembershipEvent(t, "!foo4:bar", "@alice:localhost", "join"))
+	waitForOffsetProcessed(t, db, offset)
 
 	testCases := []struct {
 		req     api.QuerySharedUsersRequest

@@ -37,14 +37,14 @@ type OutputTypingEventConsumer struct {
 // NewOutputTypingEventConsumer creates a new OutputTypingEventConsumer.
 // Call Start() to begin consuming from the EDU server.
 func NewOutputTypingEventConsumer(
-	cfg *config.Dendrite,
+	cfg *config.SyncAPI,
 	kafkaConsumer sarama.Consumer,
 	n *sync.Notifier,
 	store storage.Database,
 ) *OutputTypingEventConsumer {
 
 	consumer := internal.ContinualConsumer{
-		Topic:          string(cfg.Kafka.Topics.OutputTypingEvent),
+		Topic:          string(cfg.Matrix.Kafka.TopicFor(config.TopicOutputTypingEvent)),
 		Consumer:       kafkaConsumer,
 		PartitionStore: store,
 	}
@@ -65,7 +65,7 @@ func (s *OutputTypingEventConsumer) Start() error {
 	s.db.SetTypingTimeoutCallback(func(userID, roomID string, latestSyncPosition int64) {
 		s.notifier.OnNewEvent(
 			nil, roomID, nil,
-			types.NewStreamToken(0, types.StreamPosition(latestSyncPosition)),
+			types.NewStreamToken(0, types.StreamPosition(latestSyncPosition), nil),
 		)
 	})
 
@@ -94,6 +94,6 @@ func (s *OutputTypingEventConsumer) onMessage(msg *sarama.ConsumerMessage) error
 		typingPos = s.db.RemoveTypingUser(typingEvent.UserID, typingEvent.RoomID)
 	}
 
-	s.notifier.OnNewEvent(nil, output.Event.RoomID, nil, types.NewStreamToken(0, typingPos))
+	s.notifier.OnNewEvent(nil, output.Event.RoomID, nil, types.NewStreamToken(0, typingPos, nil))
 	return nil
 }

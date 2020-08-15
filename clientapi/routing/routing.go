@@ -40,10 +40,6 @@ import (
 	"github.com/matrix-org/util"
 )
 
-const pathPrefixV1 = "/client/api/v1"
-const pathPrefixR0 = "/client/r0"
-const pathPrefixUnstable = "/client/unstable"
-
 // Setup registers HTTP handlers with the given ServeMux. It also supplies the given http.Client
 // to clients which need to make outbound HTTP requests.
 //
@@ -51,7 +47,7 @@ const pathPrefixUnstable = "/client/unstable"
 // applied:
 // nolint: gocyclo
 func Setup(
-	publicAPIMux *mux.Router, cfg *config.Dendrite,
+	publicAPIMux *mux.Router, cfg *config.ClientAPI,
 	eduAPI eduServerAPI.EDUServerInputAPI,
 	rsAPI roomserverAPI.RoomserverInternalAPI,
 	asAPI appserviceAPI.AppServiceQueryAPI,
@@ -68,7 +64,7 @@ func Setup(
 ) {
 	userInteractiveAuth := auth.NewUserInteractive(accountDB.GetAccountByPassword, cfg)
 
-	publicAPIMux.Handle("/client/versions",
+	publicAPIMux.Handle("/versions",
 		httputil.MakeExternalAPI("versions", func(req *http.Request) util.JSONResponse {
 			return util.JSONResponse{
 				Code: http.StatusOK,
@@ -84,9 +80,9 @@ func Setup(
 		}),
 	).Methods(http.MethodGet, http.MethodOptions)
 
-	r0mux := publicAPIMux.PathPrefix(pathPrefixR0).Subrouter()
-	v1mux := publicAPIMux.PathPrefix(pathPrefixV1).Subrouter()
-	unstableMux := publicAPIMux.PathPrefix(pathPrefixUnstable).Subrouter()
+	r0mux := publicAPIMux.PathPrefix("/r0").Subrouter()
+	v1mux := publicAPIMux.PathPrefix("/api/v1").Subrouter()
+	unstableMux := publicAPIMux.PathPrefix("/unstable").Subrouter()
 
 	r0mux.Handle("/createRoom",
 		httputil.MakeAuthAPI("createRoom", userAPI, func(req *http.Request, device *userapi.Device) util.JSONResponse {
@@ -387,7 +383,7 @@ func Setup(
 
 	r0mux.Handle("/login",
 		httputil.MakeExternalAPI("login", func(req *http.Request) util.JSONResponse {
-			return Login(req, accountDB, deviceDB, cfg)
+			return Login(req, accountDB, userAPI, cfg)
 		}),
 	).Methods(http.MethodGet, http.MethodPost, http.MethodOptions)
 
@@ -644,7 +640,7 @@ func Setup(
 			if err != nil {
 				return util.ErrorResponse(err)
 			}
-			return UpdateDeviceByID(req, deviceDB, device, vars["deviceID"])
+			return UpdateDeviceByID(req, userAPI, device, vars["deviceID"])
 		}),
 	).Methods(http.MethodPut, http.MethodOptions)
 
@@ -654,13 +650,13 @@ func Setup(
 			if err != nil {
 				return util.ErrorResponse(err)
 			}
-			return DeleteDeviceById(req, userInteractiveAuth, deviceDB, device, vars["deviceID"])
+			return DeleteDeviceById(req, userInteractiveAuth, userAPI, device, vars["deviceID"])
 		}),
 	).Methods(http.MethodDelete, http.MethodOptions)
 
 	r0mux.Handle("/delete_devices",
 		httputil.MakeAuthAPI("delete_devices", userAPI, func(req *http.Request, device *userapi.Device) util.JSONResponse {
-			return DeleteDevices(req, deviceDB, device)
+			return DeleteDevices(req, userAPI, device)
 		}),
 	).Methods(http.MethodPost, http.MethodOptions)
 

@@ -17,8 +17,11 @@ package sqlite3
 import (
 	"context"
 	"database/sql"
+	"math"
 
+	"github.com/Shopify/sarama"
 	"github.com/matrix-org/dendrite/internal"
+	"github.com/matrix-org/dendrite/internal/sqlutil"
 	"github.com/matrix-org/dendrite/keyserver/storage/tables"
 )
 
@@ -45,17 +48,19 @@ const upsertKeyChangeSQL = "" +
 // select the highest offset for each user in the range. The grouping by user gives distinct entries and then we just
 // take the max offset value as the latest offset.
 const selectKeyChangesSQL = "" +
-	"SELECT user_id, MAX(offset) FROM keyserver_key_changes WHERE partition = $1 AND offset > $2 GROUP BY user_id"
+	"SELECT user_id, MAX(offset) FROM keyserver_key_changes WHERE partition = $1 AND offset > $2 AND offset <= $3 GROUP BY user_id"
 
 type keyChangesStatements struct {
 	db                   *sql.DB
+	writer               *sqlutil.TransactionWriter
 	upsertKeyChangeStmt  *sql.Stmt
 	selectKeyChangesStmt *sql.Stmt
 }
 
 func NewSqliteKeyChangesTable(db *sql.DB) (tables.KeyChanges, error) {
 	s := &keyChangesStatements{
-		db: db,
+		db:     db,
+		writer: sqlutil.NewTransactionWriter(),
 	}
 	_, err := db.Exec(keyChangesSchema)
 	if err != nil {
@@ -71,14 +76,19 @@ func NewSqliteKeyChangesTable(db *sql.DB) (tables.KeyChanges, error) {
 }
 
 func (s *keyChangesStatements) InsertKeyChange(ctx context.Context, partition int32, offset int64, userID string) error {
-	_, err := s.upsertKeyChangeStmt.ExecContext(ctx, partition, offset, userID)
-	return err
+	return s.writer.Do(s.db, nil, func(txn *sql.Tx) error {
+		_, err := s.upsertKeyChangeStmt.ExecContext(ctx, partition, offset, userID)
+		return err
+	})
 }
 
 func (s *keyChangesStatements) SelectKeyChanges(
-	ctx context.Context, partition int32, fromOffset int64,
+	ctx context.Context, partition int32, fromOffset, toOffset int64,
 ) (userIDs []string, latestOffset int64, err error) {
-	rows, err := s.selectKeyChangesStmt.QueryContext(ctx, partition, fromOffset)
+	if toOffset == sarama.OffsetNewest {
+		toOffset = math.MaxInt64
+	}
+	rows, err := s.selectKeyChangesStmt.QueryContext(ctx, partition, fromOffset, toOffset)
 	if err != nil {
 		return nil, 0, err
 	}

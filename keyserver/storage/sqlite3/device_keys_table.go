@@ -17,6 +17,7 @@ package sqlite3
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"time"
 
 	"github.com/matrix-org/dendrite/internal"
@@ -32,33 +33,48 @@ CREATE TABLE IF NOT EXISTS keyserver_device_keys (
 	device_id TEXT NOT NULL,
 	ts_added_secs BIGINT NOT NULL,
 	key_json TEXT NOT NULL,
+	stream_id BIGINT NOT NULL,
+	display_name TEXT,
 	-- Clobber based on tuple of user/device.
     UNIQUE (user_id, device_id)
 );
 `
 
 const upsertDeviceKeysSQL = "" +
-	"INSERT INTO keyserver_device_keys (user_id, device_id, ts_added_secs, key_json)" +
-	" VALUES ($1, $2, $3, $4)" +
+	"INSERT INTO keyserver_device_keys (user_id, device_id, ts_added_secs, key_json, stream_id, display_name)" +
+	" VALUES ($1, $2, $3, $4, $5, $6)" +
 	" ON CONFLICT (user_id, device_id)" +
-	" DO UPDATE SET key_json = $4"
+	" DO UPDATE SET key_json = $4, stream_id = $5, display_name = $6"
 
 const selectDeviceKeysSQL = "" +
-	"SELECT key_json FROM keyserver_device_keys WHERE user_id=$1 AND device_id=$2"
+	"SELECT key_json, stream_id, display_name FROM keyserver_device_keys WHERE user_id=$1 AND device_id=$2"
 
 const selectBatchDeviceKeysSQL = "" +
-	"SELECT device_id, key_json FROM keyserver_device_keys WHERE user_id=$1"
+	"SELECT device_id, key_json, stream_id, display_name FROM keyserver_device_keys WHERE user_id=$1"
+
+const selectMaxStreamForUserSQL = "" +
+	"SELECT MAX(stream_id) FROM keyserver_device_keys WHERE user_id=$1"
+
+const countStreamIDsForUserSQL = "" +
+	"SELECT COUNT(*) FROM keyserver_device_keys WHERE user_id=$1 AND stream_id IN ($2)"
+
+const deleteAllDeviceKeysSQL = "" +
+	"DELETE FROM keyserver_device_keys WHERE user_id=$1"
 
 type deviceKeysStatements struct {
-	db                        *sql.DB
-	upsertDeviceKeysStmt      *sql.Stmt
-	selectDeviceKeysStmt      *sql.Stmt
-	selectBatchDeviceKeysStmt *sql.Stmt
+	db                         *sql.DB
+	writer                     *sqlutil.TransactionWriter
+	upsertDeviceKeysStmt       *sql.Stmt
+	selectDeviceKeysStmt       *sql.Stmt
+	selectBatchDeviceKeysStmt  *sql.Stmt
+	selectMaxStreamForUserStmt *sql.Stmt
+	deleteAllDeviceKeysStmt    *sql.Stmt
 }
 
 func NewSqliteDeviceKeysTable(db *sql.DB) (tables.DeviceKeys, error) {
 	s := &deviceKeysStatements{
-		db: db,
+		db:     db,
+		writer: sqlutil.NewTransactionWriter(),
 	}
 	_, err := db.Exec(deviceKeysSchema)
 	if err != nil {
@@ -73,10 +89,21 @@ func NewSqliteDeviceKeysTable(db *sql.DB) (tables.DeviceKeys, error) {
 	if s.selectBatchDeviceKeysStmt, err = db.Prepare(selectBatchDeviceKeysSQL); err != nil {
 		return nil, err
 	}
+	if s.selectMaxStreamForUserStmt, err = db.Prepare(selectMaxStreamForUserSQL); err != nil {
+		return nil, err
+	}
+	if s.deleteAllDeviceKeysStmt, err = db.Prepare(deleteAllDeviceKeysSQL); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 
-func (s *deviceKeysStatements) SelectBatchDeviceKeys(ctx context.Context, userID string, deviceIDs []string) ([]api.DeviceKeys, error) {
+func (s *deviceKeysStatements) DeleteAllDeviceKeys(ctx context.Context, txn *sql.Tx, userID string) error {
+	_, err := txn.Stmt(s.deleteAllDeviceKeysStmt).ExecContext(ctx, userID)
+	return err
+}
+
+func (s *deviceKeysStatements) SelectBatchDeviceKeys(ctx context.Context, userID string, deviceIDs []string) ([]api.DeviceMessage, error) {
 	deviceIDMap := make(map[string]bool)
 	for _, d := range deviceIDs {
 		deviceIDMap[d] = true
@@ -86,15 +113,21 @@ func (s *deviceKeysStatements) SelectBatchDeviceKeys(ctx context.Context, userID
 		return nil, err
 	}
 	defer internal.CloseAndLogIfError(ctx, rows, "selectBatchDeviceKeysStmt: rows.close() failed")
-	var result []api.DeviceKeys
+	var result []api.DeviceMessage
 	for rows.Next() {
-		var dk api.DeviceKeys
+		var dk api.DeviceMessage
 		dk.UserID = userID
 		var keyJSON string
-		if err := rows.Scan(&dk.DeviceID, &keyJSON); err != nil {
+		var streamID int
+		var displayName sql.NullString
+		if err := rows.Scan(&dk.DeviceID, &keyJSON, &streamID, &displayName); err != nil {
 			return nil, err
 		}
 		dk.KeyJSON = []byte(keyJSON)
+		dk.StreamID = streamID
+		if displayName.Valid {
+			dk.DisplayName = displayName.String
+		}
 		// include the key if we want all keys (no device) or it was asked
 		if deviceIDMap[dk.DeviceID] || len(deviceIDs) == 0 {
 			result = append(result, dk)
@@ -103,25 +136,63 @@ func (s *deviceKeysStatements) SelectBatchDeviceKeys(ctx context.Context, userID
 	return result, rows.Err()
 }
 
-func (s *deviceKeysStatements) SelectDeviceKeysJSON(ctx context.Context, keys []api.DeviceKeys) error {
+func (s *deviceKeysStatements) SelectDeviceKeysJSON(ctx context.Context, keys []api.DeviceMessage) error {
 	for i, key := range keys {
 		var keyJSONStr string
-		err := s.selectDeviceKeysStmt.QueryRowContext(ctx, key.UserID, key.DeviceID).Scan(&keyJSONStr)
+		var streamID int
+		var displayName sql.NullString
+		err := s.selectDeviceKeysStmt.QueryRowContext(ctx, key.UserID, key.DeviceID).Scan(&keyJSONStr, &streamID, &displayName)
 		if err != nil && err != sql.ErrNoRows {
 			return err
 		}
 		// this will be '' when there is no device
 		keys[i].KeyJSON = []byte(keyJSONStr)
+		keys[i].StreamID = streamID
+		if displayName.Valid {
+			keys[i].DisplayName = displayName.String
+		}
 	}
 	return nil
 }
 
-func (s *deviceKeysStatements) InsertDeviceKeys(ctx context.Context, keys []api.DeviceKeys) error {
-	now := time.Now().Unix()
-	return sqlutil.WithTransaction(s.db, func(txn *sql.Tx) error {
+func (s *deviceKeysStatements) SelectMaxStreamIDForUser(ctx context.Context, txn *sql.Tx, userID string) (streamID int32, err error) {
+	// nullable if there are no results
+	var nullStream sql.NullInt32
+	err = txn.Stmt(s.selectMaxStreamForUserStmt).QueryRowContext(ctx, userID).Scan(&nullStream)
+	if err == sql.ErrNoRows {
+		err = nil
+	}
+	if nullStream.Valid {
+		streamID = nullStream.Int32
+	}
+	return
+}
+
+func (s *deviceKeysStatements) CountStreamIDsForUser(ctx context.Context, userID string, streamIDs []int64) (int, error) {
+	iStreamIDs := make([]interface{}, len(streamIDs)+1)
+	iStreamIDs[0] = userID
+	for i := range streamIDs {
+		iStreamIDs[i+1] = streamIDs[i]
+	}
+	query := strings.Replace(countStreamIDsForUserSQL, "($2)", sqlutil.QueryVariadicOffset(len(streamIDs), 1), 1)
+	// nullable if there are no results
+	var count sql.NullInt32
+	err := s.db.QueryRowContext(ctx, query, iStreamIDs...).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	if count.Valid {
+		return int(count.Int32), nil
+	}
+	return 0, nil
+}
+
+func (s *deviceKeysStatements) InsertDeviceKeys(ctx context.Context, txn *sql.Tx, keys []api.DeviceMessage) error {
+	return s.writer.Do(s.db, txn, func(txn *sql.Tx) error {
 		for _, key := range keys {
+			now := time.Now().Unix()
 			_, err := txn.Stmt(s.upsertDeviceKeysStmt).ExecContext(
-				ctx, key.UserID, key.DeviceID, now, string(key.KeyJSON),
+				ctx, key.UserID, key.DeviceID, now, string(key.KeyJSON), key.StreamID, key.DisplayName,
 			)
 			if err != nil {
 				return err

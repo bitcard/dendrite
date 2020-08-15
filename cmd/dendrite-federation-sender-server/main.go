@@ -31,10 +31,13 @@ func main() {
 
 	rsAPI := base.RoomserverHTTPClient()
 	fsAPI := federationsender.NewInternalAPI(
-		base, federation, rsAPI, keyRing,
+		base, federation, rsAPI, base.CurrentStateAPIClient(), keyRing,
 	)
 	federationsender.AddInternalRoutes(base.InternalAPIMux, fsAPI)
 
-	base.SetupAndServeHTTP(string(base.Cfg.Bind.FederationSender), string(base.Cfg.Listen.FederationSender))
-
+	base.SetupAndServeHTTP(
+		base.Cfg.FederationSender.InternalAPI.Listen,
+		setup.NoExternalListener,
+		nil, nil,
+	)
 }

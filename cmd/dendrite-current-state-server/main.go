@@ -24,10 +24,13 @@ func main() {
 	base := setup.NewBaseDendrite(cfg, "CurrentStateServer", true)
 	defer base.Close() // nolint: errcheck
 
-	stateAPI := currentstateserver.NewInternalAPI(cfg, base.KafkaConsumer)
+	stateAPI := currentstateserver.NewInternalAPI(&cfg.CurrentStateServer, base.KafkaConsumer)
 
 	currentstateserver.AddInternalRoutes(base.InternalAPIMux, stateAPI)
 
-	base.SetupAndServeHTTP(string(base.Cfg.Bind.CurrentState), string(base.Cfg.Listen.CurrentState))
-
+	base.SetupAndServeHTTP(
+		base.Cfg.CurrentStateServer.InternalAPI.Listen,
+		setup.NoExternalListener,
+		nil, nil,
+	)
 }

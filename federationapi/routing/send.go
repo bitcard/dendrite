@@ -21,8 +21,10 @@ import (
 	"net/http"
 
 	"github.com/matrix-org/dendrite/clientapi/jsonerror"
+	currentstateAPI "github.com/matrix-org/dendrite/currentstateserver/api"
 	eduserverAPI "github.com/matrix-org/dendrite/eduserver/api"
 	"github.com/matrix-org/dendrite/internal/config"
+	keyapi "github.com/matrix-org/dendrite/keyserver/api"
 	"github.com/matrix-org/dendrite/roomserver/api"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/util"
@@ -34,9 +36,11 @@ func Send(
 	httpReq *http.Request,
 	request *gomatrixserverlib.FederationRequest,
 	txnID gomatrixserverlib.TransactionID,
-	cfg *config.Dendrite,
+	cfg *config.FederationAPI,
 	rsAPI api.RoomserverInternalAPI,
 	eduAPI eduserverAPI.EDUServerInputAPI,
+	keyAPI keyapi.KeyInternalAPI,
+	stateAPI currentstateAPI.CurrentStateInternalAPI,
 	keys gomatrixserverlib.JSONVerifier,
 	federation *gomatrixserverlib.FederationClient,
 ) util.JSONResponse {
@@ -44,10 +48,12 @@ func Send(
 		context:    httpReq.Context(),
 		rsAPI:      rsAPI,
 		eduAPI:     eduAPI,
+		stateAPI:   stateAPI,
 		keys:       keys,
 		federation: federation,
 		haveEvents: make(map[string]*gomatrixserverlib.HeaderedEvent),
 		newEvents:  make(map[string]bool),
+		keyAPI:     keyAPI,
 	}
 
 	var txnEvents struct {
@@ -100,6 +106,8 @@ type txnReq struct {
 	context    context.Context
 	rsAPI      api.RoomserverInternalAPI
 	eduAPI     eduserverAPI.EDUServerInputAPI
+	keyAPI     keyapi.KeyInternalAPI
+	stateAPI   currentstateAPI.CurrentStateInternalAPI
 	keys       gomatrixserverlib.JSONVerifier
 	federation txnFederationClient
 	// local cache of events for auth checks, etc - this may include events
@@ -160,6 +168,12 @@ func (t *txnReq) processTransaction() (*gomatrixserverlib.RespSend, *util.JSONRe
 			util.GetLogger(t.context).WithError(err).Warnf("Transaction: Failed to parse event JSON of event %s", string(pdu))
 			continue
 		}
+		if currentstateAPI.IsServerBannedFromRoom(t.context, t.stateAPI, event.RoomID(), t.Origin) {
+			results[event.EventID()] = gomatrixserverlib.PDUResult{
+				Error: "Forbidden by server ACLs",
+			}
+			continue
+		}
 		if err = gomatrixserverlib.VerifyAllEventSignatures(t.context, []gomatrixserverlib.Event{event}, t.keys); err != nil {
 			util.GetLogger(t.context).WithError(err).Warnf("Transaction: Couldn't validate signature of event %q", event.EventID())
 			results[event.EventID()] = gomatrixserverlib.PDUResult{
@@ -214,7 +228,9 @@ func (t *txnReq) processTransaction() (*gomatrixserverlib.RespSend, *util.JSONRe
 	}
 
 	t.processEDUs(t.EDUs)
-	util.GetLogger(t.context).Infof("Processed %d PDUs from transaction %q", len(results), t.TransactionID)
+	if c := len(results); c > 0 {
+		util.GetLogger(t.context).Infof("Processed %d PDUs from transaction %q", c, t.TransactionID)
+	}
 	return &gomatrixserverlib.RespSend{PDUs: results}, nil
 }
 
@@ -308,9 +324,26 @@ func (t *txnReq) processEDUs(edus []gomatrixserverlib.EDU) {
 					}
 				}
 			}
+		case gomatrixserverlib.MDeviceListUpdate:
+			t.processDeviceListUpdate(e)
 		default:
-			util.GetLogger(t.context).WithField("type", e.Type).Warn("unhandled edu")
+			util.GetLogger(t.context).WithField("type", e.Type).Debug("Unhandled EDU")
 		}
+	}
+}
+
+func (t *txnReq) processDeviceListUpdate(e gomatrixserverlib.EDU) {
+	var payload gomatrixserverlib.DeviceListUpdateEvent
+	if err := json.Unmarshal(e.Content, &payload); err != nil {
+		util.GetLogger(t.context).WithError(err).Error("Failed to unmarshal device list update event")
+		return
+	}
+	var inputRes keyapi.InputDeviceListUpdateResponse
+	t.keyAPI.InputDeviceListUpdate(context.Background(), &keyapi.InputDeviceListUpdateRequest{
+		Event: payload,
+	}, &inputRes)
+	if inputRes.Error != nil {
+		util.GetLogger(t.context).WithError(inputRes.Error).WithField("user_id", payload.UserID).Error("failed to InputDeviceListUpdate")
 	}
 }
 

@@ -20,6 +20,7 @@ import (
 	"github.com/matrix-org/dendrite/roomserver/inthttp"
 	"github.com/matrix-org/gomatrixserverlib"
 
+	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/setup"
 	"github.com/matrix-org/dendrite/roomserver/internal"
 	"github.com/matrix-org/dendrite/roomserver/storage"
@@ -39,18 +40,20 @@ func NewInternalAPI(
 	keyRing gomatrixserverlib.JSONVerifier,
 	fedClient *gomatrixserverlib.FederationClient,
 ) api.RoomserverInternalAPI {
-	roomserverDB, err := storage.Open(string(base.Cfg.Database.RoomServer), base.Cfg.DbProperties())
+	cfg := &base.Cfg.RoomServer
+
+	roomserverDB, err := storage.Open(&cfg.Database)
 	if err != nil {
 		logrus.WithError(err).Panicf("failed to connect to room server db")
 	}
 
 	return &internal.RoomserverInternalAPI{
 		DB:                   roomserverDB,
-		Cfg:                  base.Cfg,
+		Cfg:                  cfg,
 		Producer:             base.KafkaProducer,
-		OutputRoomEventTopic: string(base.Cfg.Kafka.Topics.OutputRoomEvent),
+		OutputRoomEventTopic: string(cfg.Matrix.Kafka.TopicFor(config.TopicOutputRoomEvent)),
 		Cache:                base.Caches,
-		ServerName:           base.Cfg.Matrix.ServerName,
+		ServerName:           cfg.Matrix.ServerName,
 		FedClient:            fedClient,
 		KeyRing:              keyRing,
 	}
