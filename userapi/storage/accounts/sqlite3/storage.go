@@ -33,7 +33,9 @@ import (
 
 // Database represents an account database
 type Database struct {
-	db *sql.DB
+	db     *sql.DB
+	writer sqlutil.Writer
+
 	sqlutil.PartitionOffsetStatements
 	accounts     accountsStatements
 	profiles     profilesStatements
@@ -53,35 +55,28 @@ func NewDatabase(dbProperties *config.DatabaseOptions, serverName gomatrixserver
 	if err != nil {
 		return nil, err
 	}
+	d := &Database{
+		serverName: serverName,
+		db:         db,
+		writer:     sqlutil.NewExclusiveWriter(),
+	}
 	partitions := sqlutil.PartitionOffsetStatements{}
-	if err = partitions.Prepare(db, "account"); err != nil {
+	if err = partitions.Prepare(db, d.writer, "account"); err != nil {
 		return nil, err
 	}
-	a := accountsStatements{}
-	if err = a.prepare(db, serverName); err != nil {
+	if err = d.accounts.prepare(db, serverName); err != nil {
 		return nil, err
 	}
-	p := profilesStatements{}
-	if err = p.prepare(db); err != nil {
+	if err = d.profiles.prepare(db); err != nil {
 		return nil, err
 	}
-	ac := accountDataStatements{}
-	if err = ac.prepare(db); err != nil {
+	if err = d.accountDatas.prepare(db); err != nil {
 		return nil, err
 	}
-	t := threepidStatements{}
-	if err = t.prepare(db); err != nil {
+	if err = d.threepids.prepare(db); err != nil {
 		return nil, err
 	}
-	return &Database{
-		db:                        db,
-		PartitionOffsetStatements: partitions,
-		accounts:                  a,
-		profiles:                  p,
-		accountDatas:              ac,
-		threepids:                 t,
-		serverName:                serverName,
-	}, nil
+	return d, nil
 }
 
 // GetAccountByPassword returns the account associated with the given localpart and password.
@@ -114,7 +109,9 @@ func (d *Database) SetAvatarURL(
 ) error {
 	d.profilesMu.Lock()
 	defer d.profilesMu.Unlock()
-	return d.profiles.setAvatarURL(ctx, localpart, avatarURL)
+	return d.writer.Do(d.db, nil, func(txn *sql.Tx) error {
+		return d.profiles.setAvatarURL(ctx, txn, localpart, avatarURL)
+	})
 }
 
 // SetDisplayName updates the display name of the profile associated with the given
@@ -124,7 +121,21 @@ func (d *Database) SetDisplayName(
 ) error {
 	d.profilesMu.Lock()
 	defer d.profilesMu.Unlock()
-	return d.profiles.setDisplayName(ctx, localpart, displayName)
+	return d.writer.Do(d.db, nil, func(txn *sql.Tx) error {
+		return d.profiles.setDisplayName(ctx, txn, localpart, displayName)
+	})
+}
+
+// SetPassword sets the account password to the given hash.
+func (d *Database) SetPassword(
+	ctx context.Context, localpart, plaintextPassword string,
+) error {
+	hash, err := hashPassword(plaintextPassword)
+	if err != nil {
+		return err
+	}
+	err = d.accounts.updatePassword(ctx, localpart, hash)
+	return err
 }
 
 // CreateGuestAccount makes a new guest account and creates an empty profile
@@ -141,7 +152,7 @@ func (d *Database) CreateGuestAccount(ctx context.Context) (acc *api.Account, er
 	defer d.profilesMu.Unlock()
 	defer d.accountDatasMu.Unlock()
 	defer d.accountsMu.Unlock()
-	err = sqlutil.WithTransaction(d.db, func(txn *sql.Tx) error {
+	err = d.writer.Do(d.db, nil, func(txn *sql.Tx) error {
 		var numLocalpart int64
 		numLocalpart, err = d.accounts.selectNewNumericLocalpart(ctx, txn)
 		if err != nil {
@@ -167,7 +178,7 @@ func (d *Database) CreateAccount(
 	defer d.profilesMu.Unlock()
 	defer d.accountDatasMu.Unlock()
 	defer d.accountsMu.Unlock()
-	err = sqlutil.WithTransaction(d.db, func(txn *sql.Tx) error {
+	err = d.writer.Do(d.db, nil, func(txn *sql.Tx) error {
 		acc, err = d.createAccount(ctx, txn, localpart, plaintextPassword, appserviceID)
 		return err
 	})
@@ -219,7 +230,7 @@ func (d *Database) SaveAccountData(
 ) error {
 	d.accountDatasMu.Lock()
 	defer d.accountDatasMu.Unlock()
-	return sqlutil.WithTransaction(d.db, func(txn *sql.Tx) error {
+	return d.writer.Do(d.db, nil, func(txn *sql.Tx) error {
 		return d.accountDatas.insertAccountData(ctx, txn, localpart, roomID, dataType, content)
 	})
 }
@@ -272,7 +283,7 @@ func (d *Database) SaveThreePIDAssociation(
 ) (err error) {
 	d.threepidsMu.Lock()
 	defer d.threepidsMu.Unlock()
-	return sqlutil.WithTransaction(d.db, func(txn *sql.Tx) error {
+	return d.writer.Do(d.db, nil, func(txn *sql.Tx) error {
 		user, err := d.threepids.selectLocalpartForThreePID(
 			ctx, txn, threepid, medium,
 		)
@@ -297,7 +308,9 @@ func (d *Database) RemoveThreePIDAssociation(
 ) (err error) {
 	d.threepidsMu.Lock()
 	defer d.threepidsMu.Unlock()
-	return d.threepids.deleteThreePID(ctx, threepid, medium)
+	return d.writer.Do(d.db, nil, func(txn *sql.Tx) error {
+		return d.threepids.deleteThreePID(ctx, txn, threepid, medium)
+	})
 }
 
 // GetLocalpartForThreePID looks up the localpart associated with a given third-party

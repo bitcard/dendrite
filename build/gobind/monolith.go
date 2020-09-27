@@ -13,7 +13,6 @@ import (
 	"github.com/matrix-org/dendrite/cmd/dendrite-demo-yggdrasil/signing"
 	"github.com/matrix-org/dendrite/cmd/dendrite-demo-yggdrasil/yggconn"
 	"github.com/matrix-org/dendrite/cmd/dendrite-demo-yggdrasil/yggrooms"
-	"github.com/matrix-org/dendrite/currentstateserver"
 	"github.com/matrix-org/dendrite/eduserver"
 	"github.com/matrix-org/dendrite/eduserver/cache"
 	"github.com/matrix-org/dendrite/federationsender"
@@ -99,7 +98,6 @@ func (m *DendriteMonolith) Start() {
 	cfg.KeyServer.Database.ConnectionString = config.DataSource(fmt.Sprintf("file:%s/dendrite-keyserver.db", m.StorageDirectory))
 	cfg.FederationSender.Database.ConnectionString = config.DataSource(fmt.Sprintf("file:%s/dendrite-federationsender.db", m.StorageDirectory))
 	cfg.AppServiceAPI.Database.ConnectionString = config.DataSource(fmt.Sprintf("file:%s/dendrite-appservice.db", m.StorageDirectory))
-	cfg.CurrentStateServer.Database.ConnectionString = config.DataSource(fmt.Sprintf("file:%s/dendrite-currentstate.db", m.StorageDirectory))
 	cfg.MediaAPI.BasePath = config.Path(fmt.Sprintf("%s/tmp", m.StorageDirectory))
 	cfg.MediaAPI.AbsBasePath = config.Path(fmt.Sprintf("%s/tmp", m.StorageDirectory))
 	cfg.FederationSender.FederationMaxRetries = 8
@@ -111,17 +109,16 @@ func (m *DendriteMonolith) Start() {
 	defer base.Close() // nolint: errcheck
 
 	accountDB := base.CreateAccountsDB()
-	deviceDB := base.CreateDeviceDB()
 	federation := ygg.CreateFederationClient(base)
 
 	serverKeyAPI := &signing.YggdrasilKeys{}
 	keyRing := serverKeyAPI.KeyRing()
 	keyAPI := keyserver.NewInternalAPI(&base.Cfg.KeyServer, federation, base.KafkaProducer)
-	userAPI := userapi.NewInternalAPI(accountDB, deviceDB, cfg.Global.ServerName, cfg.Derived.ApplicationServices, keyAPI)
+	userAPI := userapi.NewInternalAPI(accountDB, &cfg.UserAPI, cfg.Derived.ApplicationServices, keyAPI)
 	keyAPI.SetUserAPI(userAPI)
 
 	rsAPI := roomserver.NewInternalAPI(
-		base, keyRing, federation,
+		base, keyRing,
 	)
 
 	eduInputAPI := eduserver.NewInternalAPI(
@@ -129,9 +126,8 @@ func (m *DendriteMonolith) Start() {
 	)
 
 	asAPI := appservice.NewInternalAPI(base, userAPI, rsAPI)
-	stateAPI := currentstateserver.NewInternalAPI(&base.Cfg.CurrentStateServer, base.KafkaConsumer)
 	fsAPI := federationsender.NewInternalAPI(
-		base, federation, rsAPI, stateAPI, keyRing,
+		base, federation, rsAPI, keyRing,
 	)
 
 	ygg.SetSessionFunc(func(address string) {
@@ -153,7 +149,6 @@ func (m *DendriteMonolith) Start() {
 	monolith := setup.Monolith{
 		Config:        base.Cfg,
 		AccountDB:     accountDB,
-		DeviceDB:      deviceDB,
 		Client:        ygg.CreateClient(base),
 		FedClient:     federation,
 		KeyRing:       keyRing,
@@ -165,7 +160,6 @@ func (m *DendriteMonolith) Start() {
 		FederationSenderAPI: fsAPI,
 		RoomserverAPI:       rsAPI,
 		UserAPI:             userAPI,
-		StateAPI:            stateAPI,
 		KeyAPI:              keyAPI,
 		ExtPublicRoomsProvider: yggrooms.NewYggdrasilRoomProvider(
 			ygg, fsAPI, federation,

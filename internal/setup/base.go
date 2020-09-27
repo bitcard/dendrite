@@ -21,24 +21,22 @@ import (
 	"net/url"
 	"time"
 
-	currentstateAPI "github.com/matrix-org/dendrite/currentstateserver/api"
 	"github.com/matrix-org/dendrite/internal/caching"
 	"github.com/matrix-org/dendrite/internal/httputil"
-	"github.com/matrix-org/dendrite/internal/sqlutil"
 	"github.com/matrix-org/gomatrixserverlib"
-	"github.com/matrix-org/naffka"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/matrix-org/naffka"
+	naffkaStorage "github.com/matrix-org/naffka/storage"
 
 	"github.com/matrix-org/dendrite/internal"
 	"github.com/matrix-org/dendrite/userapi/storage/accounts"
-	"github.com/matrix-org/dendrite/userapi/storage/devices"
 
 	"github.com/Shopify/sarama"
 	"github.com/gorilla/mux"
 
 	appserviceAPI "github.com/matrix-org/dendrite/appservice/api"
 	asinthttp "github.com/matrix-org/dendrite/appservice/inthttp"
-	currentstateinthttp "github.com/matrix-org/dendrite/currentstateserver/inthttp"
 	eduServerAPI "github.com/matrix-org/dendrite/eduserver/api"
 	eduinthttp "github.com/matrix-org/dendrite/eduserver/inthttp"
 	federationSenderAPI "github.com/matrix-org/dendrite/federationsender/api"
@@ -99,6 +97,8 @@ func NewBaseDendrite(cfg *config.Dendrite, componentName string, useHTTPAPIs boo
 	internal.SetupStdLogging()
 	internal.SetupHookLogging(cfg.Logging, componentName)
 	internal.SetupPprof()
+
+	logrus.Infof("Dendrite version %s", internal.VersionString())
 
 	closer, err := cfg.SetupTracing("Dendrite" + componentName)
 	if err != nil {
@@ -186,15 +186,6 @@ func (b *BaseDendrite) UserAPIClient() userapi.UserInternalAPI {
 	return userAPI
 }
 
-// CurrentStateAPIClient returns CurrentStateInternalAPI for hitting the currentstateserver over HTTP.
-func (b *BaseDendrite) CurrentStateAPIClient() currentstateAPI.CurrentStateInternalAPI {
-	stateAPI, err := currentstateinthttp.NewCurrentStateAPIClient(b.Cfg.CurrentStateAPIURL(), b.httpClient)
-	if err != nil {
-		logrus.WithError(err).Panic("UserAPIClient failed", b.httpClient)
-	}
-	return stateAPI
-}
-
 // EDUServerClient returns EDUServerInputAPI for hitting the EDU server over HTTP
 func (b *BaseDendrite) EDUServerClient() eduServerAPI.EDUServerInputAPI {
 	e, err := eduinthttp.NewEDUServerClient(b.Cfg.EDUServerURL(), b.httpClient)
@@ -236,17 +227,6 @@ func (b *BaseDendrite) KeyServerHTTPClient() keyserverAPI.KeyInternalAPI {
 	return f
 }
 
-// CreateDeviceDB creates a new instance of the device database. Should only be
-// called once per component.
-func (b *BaseDendrite) CreateDeviceDB() devices.Database {
-	db, err := devices.NewDatabase(&b.Cfg.UserAPI.DeviceDatabase, b.Cfg.Global.ServerName)
-	if err != nil {
-		logrus.WithError(err).Panicf("failed to connect to devices db")
-	}
-
-	return db
-}
-
 // CreateAccountsDB creates a new instance of the accounts database. Should only
 // be called once per component.
 func (b *BaseDendrite) CreateAccountsDB() accounts.Database {
@@ -277,7 +257,7 @@ func (b *BaseDendrite) SetupAndServeHTTP(
 	internalAddr, _ := internalHTTPAddr.Address()
 	externalAddr, _ := externalHTTPAddr.Address()
 
-	internalRouter := mux.NewRouter()
+	internalRouter := mux.NewRouter().SkipClean(true).UseEncodedPath()
 	externalRouter := internalRouter
 
 	internalServ := &http.Server{
@@ -288,7 +268,7 @@ func (b *BaseDendrite) SetupAndServeHTTP(
 	externalServ := internalServ
 
 	if externalAddr != NoExternalListener && externalAddr != internalAddr {
-		externalRouter = mux.NewRouter()
+		externalRouter = mux.NewRouter().SkipClean(true).UseEncodedPath()
 		externalServ = &http.Server{
 			Addr:         string(externalAddr),
 			WriteTimeout: HTTPServerTimeout,
@@ -356,36 +336,13 @@ func setupKafka(cfg *config.Dendrite) (sarama.Consumer, sarama.SyncProducer) {
 
 // setupNaffka creates kafka consumer/producer pair from the config.
 func setupNaffka(cfg *config.Dendrite) (sarama.Consumer, sarama.SyncProducer) {
-	var naffkaDB *naffka.DatabaseImpl
-
-	db, err := sqlutil.Open(&cfg.Global.Kafka.Database)
+	naffkaDB, err := naffkaStorage.NewDatabase(string(cfg.Global.Kafka.Database.ConnectionString))
 	if err != nil {
-		logrus.WithError(err).Panic("Failed to open naffka database")
+		logrus.WithError(err).Panic("Failed to setup naffka database")
 	}
-
-	switch {
-	case cfg.Global.Kafka.Database.ConnectionString.IsSQLite():
-		naffkaDB, err = naffka.NewSqliteDatabase(db)
-		if err != nil {
-			logrus.WithError(err).Panic("Failed to setup naffka database")
-		}
-	case cfg.Global.Kafka.Database.ConnectionString.IsPostgres():
-		naffkaDB, err = naffka.NewPostgresqlDatabase(db)
-		if err != nil {
-			logrus.WithError(err).Panic("Failed to setup naffka database")
-		}
-	default:
-		panic("unknown naffka database type")
-	}
-
-	if naffkaDB == nil {
-		panic("naffka connection string not understood")
-	}
-
 	naff, err := naffka.New(naffkaDB)
 	if err != nil {
 		logrus.WithError(err).Panic("Failed to setup naffka")
 	}
-
 	return naff, naff
 }

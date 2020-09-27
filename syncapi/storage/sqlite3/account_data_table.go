@@ -51,7 +51,6 @@ const selectMaxAccountDataIDSQL = "" +
 
 type accountDataStatements struct {
 	db                           *sql.DB
-	writer                       *sqlutil.TransactionWriter
 	streamIDStatements           *streamIDStatements
 	insertAccountDataStmt        *sql.Stmt
 	selectMaxAccountDataIDStmt   *sql.Stmt
@@ -61,7 +60,6 @@ type accountDataStatements struct {
 func NewSqliteAccountDataTable(db *sql.DB, streamID *streamIDStatements) (tables.AccountData, error) {
 	s := &accountDataStatements{
 		db:                 db,
-		writer:             sqlutil.NewTransactionWriter(),
 		streamIDStatements: streamID,
 	}
 	_, err := db.Exec(accountDataSchema)
@@ -84,15 +82,12 @@ func (s *accountDataStatements) InsertAccountData(
 	ctx context.Context, txn *sql.Tx,
 	userID, roomID, dataType string,
 ) (pos types.StreamPosition, err error) {
-	return pos, s.writer.Do(s.db, nil, func(txn *sql.Tx) error {
-		var err error
-		pos, err = s.streamIDStatements.nextStreamID(ctx, txn)
-		if err != nil {
-			return err
-		}
-		_, err = txn.Stmt(s.insertAccountDataStmt).ExecContext(ctx, pos, userID, roomID, dataType)
-		return err
-	})
+	pos, err = s.streamIDStatements.nextStreamID(ctx, txn)
+	if err != nil {
+		return
+	}
+	_, err = sqlutil.TxStmt(txn, s.insertAccountDataStmt).ExecContext(ctx, pos, userID, roomID, dataType)
+	return
 }
 
 func (s *accountDataStatements) SelectAccountDataInRange(
@@ -153,7 +148,7 @@ func (s *accountDataStatements) SelectMaxAccountDataID(
 	ctx context.Context, txn *sql.Tx,
 ) (id int64, err error) {
 	var nullableID sql.NullInt64
-	err = txn.Stmt(s.selectMaxAccountDataIDStmt).QueryRowContext(ctx).Scan(&nullableID)
+	err = sqlutil.TxStmt(txn, s.selectMaxAccountDataIDStmt).QueryRowContext(ctx).Scan(&nullableID)
 	if nullableID.Valid {
 		id = nullableID.Int64
 	}

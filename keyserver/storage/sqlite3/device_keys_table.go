@@ -50,7 +50,7 @@ const selectDeviceKeysSQL = "" +
 	"SELECT key_json, stream_id, display_name FROM keyserver_device_keys WHERE user_id=$1 AND device_id=$2"
 
 const selectBatchDeviceKeysSQL = "" +
-	"SELECT device_id, key_json, stream_id, display_name FROM keyserver_device_keys WHERE user_id=$1"
+	"SELECT device_id, key_json, stream_id, display_name FROM keyserver_device_keys WHERE user_id=$1 AND key_json <> ''"
 
 const selectMaxStreamForUserSQL = "" +
 	"SELECT MAX(stream_id) FROM keyserver_device_keys WHERE user_id=$1"
@@ -63,7 +63,6 @@ const deleteAllDeviceKeysSQL = "" +
 
 type deviceKeysStatements struct {
 	db                         *sql.DB
-	writer                     *sqlutil.TransactionWriter
 	upsertDeviceKeysStmt       *sql.Stmt
 	selectDeviceKeysStmt       *sql.Stmt
 	selectBatchDeviceKeysStmt  *sql.Stmt
@@ -73,8 +72,7 @@ type deviceKeysStatements struct {
 
 func NewSqliteDeviceKeysTable(db *sql.DB) (tables.DeviceKeys, error) {
 	s := &deviceKeysStatements{
-		db:     db,
-		writer: sqlutil.NewTransactionWriter(),
+		db: db,
 	}
 	_, err := db.Exec(deviceKeysSchema)
 	if err != nil {
@@ -99,7 +97,7 @@ func NewSqliteDeviceKeysTable(db *sql.DB) (tables.DeviceKeys, error) {
 }
 
 func (s *deviceKeysStatements) DeleteAllDeviceKeys(ctx context.Context, txn *sql.Tx, userID string) error {
-	_, err := txn.Stmt(s.deleteAllDeviceKeysStmt).ExecContext(ctx, userID)
+	_, err := sqlutil.TxStmt(txn, s.deleteAllDeviceKeysStmt).ExecContext(ctx, userID)
 	return err
 }
 
@@ -158,7 +156,7 @@ func (s *deviceKeysStatements) SelectDeviceKeysJSON(ctx context.Context, keys []
 func (s *deviceKeysStatements) SelectMaxStreamIDForUser(ctx context.Context, txn *sql.Tx, userID string) (streamID int32, err error) {
 	// nullable if there are no results
 	var nullStream sql.NullInt32
-	err = txn.Stmt(s.selectMaxStreamForUserStmt).QueryRowContext(ctx, userID).Scan(&nullStream)
+	err = sqlutil.TxStmt(txn, s.selectMaxStreamForUserStmt).QueryRowContext(ctx, userID).Scan(&nullStream)
 	if err == sql.ErrNoRows {
 		err = nil
 	}
@@ -188,16 +186,14 @@ func (s *deviceKeysStatements) CountStreamIDsForUser(ctx context.Context, userID
 }
 
 func (s *deviceKeysStatements) InsertDeviceKeys(ctx context.Context, txn *sql.Tx, keys []api.DeviceMessage) error {
-	return s.writer.Do(s.db, txn, func(txn *sql.Tx) error {
-		for _, key := range keys {
-			now := time.Now().Unix()
-			_, err := txn.Stmt(s.upsertDeviceKeysStmt).ExecContext(
-				ctx, key.UserID, key.DeviceID, now, string(key.KeyJSON), key.StreamID, key.DisplayName,
-			)
-			if err != nil {
-				return err
-			}
+	for _, key := range keys {
+		now := time.Now().Unix()
+		_, err := sqlutil.TxStmt(txn, s.upsertDeviceKeysStmt).ExecContext(
+			ctx, key.UserID, key.DeviceID, now, string(key.KeyJSON), key.StreamID, key.DisplayName,
+		)
+		if err != nil {
+			return err
 		}
-		return nil
-	})
+	}
+	return nil
 }

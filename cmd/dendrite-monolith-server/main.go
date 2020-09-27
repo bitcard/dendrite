@@ -19,7 +19,6 @@ import (
 	"os"
 
 	"github.com/matrix-org/dendrite/appservice"
-	"github.com/matrix-org/dendrite/currentstateserver"
 	"github.com/matrix-org/dendrite/eduserver"
 	"github.com/matrix-org/dendrite/eduserver/cache"
 	"github.com/matrix-org/dendrite/federationsender"
@@ -54,7 +53,6 @@ func main() {
 		// itself.
 		cfg.AppServiceAPI.InternalAPI.Connect = httpAddr
 		cfg.ClientAPI.InternalAPI.Connect = httpAddr
-		cfg.CurrentStateServer.InternalAPI.Connect = httpAddr
 		cfg.EDUServer.InternalAPI.Connect = httpAddr
 		cfg.FederationAPI.InternalAPI.Connect = httpAddr
 		cfg.FederationSender.InternalAPI.Connect = httpAddr
@@ -69,7 +67,6 @@ func main() {
 	defer base.Close() // nolint: errcheck
 
 	accountDB := base.CreateAccountsDB()
-	deviceDB := base.CreateDeviceDB()
 	federation := base.CreateFederationClient()
 
 	serverKeyAPI := serverkeyapi.NewInternalAPI(
@@ -80,12 +77,9 @@ func main() {
 		serverKeyAPI = base.ServerKeyAPIClient()
 	}
 	keyRing := serverKeyAPI.KeyRing()
-	keyAPI := keyserver.NewInternalAPI(&base.Cfg.KeyServer, federation, base.KafkaProducer)
-	userAPI := userapi.NewInternalAPI(accountDB, deviceDB, cfg.Global.ServerName, cfg.Derived.ApplicationServices, keyAPI)
-	keyAPI.SetUserAPI(userAPI)
 
 	rsImpl := roomserver.NewInternalAPI(
-		base, keyRing, federation,
+		base, keyRing,
 	)
 	// call functions directly on the impl unless running in HTTP mode
 	rsAPI := rsImpl
@@ -98,6 +92,21 @@ func main() {
 			Impl: rsAPI,
 		}
 	}
+
+	fsAPI := federationsender.NewInternalAPI(
+		base, federation, rsAPI, keyRing,
+	)
+	if base.UseHTTPAPIs {
+		federationsender.AddInternalRoutes(base.InternalAPIMux, fsAPI)
+		fsAPI = base.FederationSenderHTTPClient()
+	}
+	// The underlying roomserver implementation needs to be able to call the fedsender.
+	// This is different to rsAPI which can be the http client which doesn't need this dependency
+	rsImpl.SetFederationSenderAPI(fsAPI)
+
+	keyAPI := keyserver.NewInternalAPI(&base.Cfg.KeyServer, fsAPI, base.KafkaProducer)
+	userAPI := userapi.NewInternalAPI(accountDB, &cfg.UserAPI, cfg.Derived.ApplicationServices, keyAPI)
+	keyAPI.SetUserAPI(userAPI)
 
 	eduInputAPI := eduserver.NewInternalAPI(
 		base, cache.New(), userAPI,
@@ -113,23 +122,9 @@ func main() {
 		asAPI = base.AppserviceHTTPClient()
 	}
 
-	stateAPI := currentstateserver.NewInternalAPI(&base.Cfg.CurrentStateServer, base.KafkaConsumer)
-
-	fsAPI := federationsender.NewInternalAPI(
-		base, federation, rsAPI, stateAPI, keyRing,
-	)
-	if base.UseHTTPAPIs {
-		federationsender.AddInternalRoutes(base.InternalAPIMux, fsAPI)
-		fsAPI = base.FederationSenderHTTPClient()
-	}
-	// The underlying roomserver implementation needs to be able to call the fedsender.
-	// This is different to rsAPI which can be the http client which doesn't need this dependency
-	rsImpl.SetFederationSenderAPI(fsAPI)
-
 	monolith := setup.Monolith{
 		Config:        base.Cfg,
 		AccountDB:     accountDB,
-		DeviceDB:      deviceDB,
 		Client:        gomatrixserverlib.NewClient(cfg.FederationSender.DisableTLSValidation),
 		FedClient:     federation,
 		KeyRing:       keyRing,
@@ -141,7 +136,6 @@ func main() {
 		FederationSenderAPI: fsAPI,
 		RoomserverAPI:       rsAPI,
 		ServerKeyAPI:        serverKeyAPI,
-		StateAPI:            stateAPI,
 		UserAPI:             userAPI,
 		KeyAPI:              keyAPI,
 	}

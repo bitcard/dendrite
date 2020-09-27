@@ -19,6 +19,7 @@ import (
 	"context"
 	"database/sql"
 
+	"github.com/matrix-org/dendrite/internal/caching"
 	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/sqlutil"
 	"github.com/matrix-org/dendrite/roomserver/storage/shared"
@@ -41,16 +42,18 @@ type Database struct {
 	invites        tables.Invites
 	membership     tables.Membership
 	db             *sql.DB
+	writer         sqlutil.Writer
 }
 
 // Open a sqlite database.
 // nolint: gocyclo
-func Open(dbProperties *config.DatabaseOptions) (*Database, error) {
+func Open(dbProperties *config.DatabaseOptions, cache caching.RoomServerCaches) (*Database, error) {
 	var d Database
 	var err error
 	if d.db, err = sqlutil.Open(dbProperties); err != nil {
 		return nil, err
 	}
+	d.writer = sqlutil.NewExclusiveWriter()
 	//d.db.Exec("PRAGMA journal_mode=WAL;")
 	//d.db.Exec("PRAGMA read_uncommitted = true;")
 
@@ -118,6 +121,8 @@ func Open(dbProperties *config.DatabaseOptions) (*Database, error) {
 	}
 	d.Database = shared.Database{
 		DB:                  d.db,
+		Cache:               cache,
+		Writer:              d.writer,
 		EventsTable:         d.events,
 		EventTypesTable:     d.eventTypes,
 		EventStateKeysTable: d.eventStateKeys,
@@ -136,27 +141,35 @@ func Open(dbProperties *config.DatabaseOptions) (*Database, error) {
 	return &d, nil
 }
 
+func (d *Database) SupportsConcurrentRoomInputs() bool {
+	// This isn't supported in SQLite mode yet because of issues with
+	// database locks.
+	// TODO: Look at this again - the problem is probably to do with
+	// the membership updaters and latest events updaters.
+	return false
+}
+
 func (d *Database) GetLatestEventsForUpdate(
-	ctx context.Context, roomNID types.RoomNID,
-) (types.RoomRecentEventsUpdater, error) {
+	ctx context.Context, roomInfo types.RoomInfo,
+) (*shared.LatestEventsUpdater, error) {
 	// TODO: Do not use transactions. We should be holding open this transaction but we cannot have
 	// multiple write transactions on sqlite. The code will perform additional
 	// write transactions independent of this one which will consistently cause
 	// 'database is locked' errors. As sqlite doesn't support multi-process on the
 	// same DB anyway, and we only execute updates sequentially, the only worries
 	// are for rolling back when things go wrong. (atomicity)
-	return shared.NewRoomRecentEventsUpdater(&d.Database, ctx, roomNID, false)
+	return shared.NewLatestEventsUpdater(ctx, &d.Database, nil, roomInfo)
 }
 
 func (d *Database) MembershipUpdater(
 	ctx context.Context, roomID, targetUserID string,
 	targetLocal bool, roomVersion gomatrixserverlib.RoomVersion,
-) (updater types.MembershipUpdater, err error) {
+) (*shared.MembershipUpdater, error) {
 	// TODO: Do not use transactions. We should be holding open this transaction but we cannot have
 	// multiple write transactions on sqlite. The code will perform additional
 	// write transactions independent of this one which will consistently cause
 	// 'database is locked' errors. As sqlite doesn't support multi-process on the
 	// same DB anyway, and we only execute updates sequentially, the only worries
 	// are for rolling back when things go wrong. (atomicity)
-	return shared.NewMembershipUpdater(ctx, &d.Database, roomID, targetUserID, targetLocal, roomVersion, false)
+	return shared.NewMembershipUpdater(ctx, &d.Database, nil, roomID, targetUserID, targetLocal, roomVersion)
 }

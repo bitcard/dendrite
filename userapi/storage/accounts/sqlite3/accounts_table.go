@@ -46,6 +46,9 @@ CREATE TABLE IF NOT EXISTS account_accounts (
 const insertAccountSQL = "" +
 	"INSERT INTO account_accounts(localpart, created_ts, password_hash, appservice_id) VALUES ($1, $2, $3, $4)"
 
+const updatePasswordSQL = "" +
+	"UPDATE account_accounts SET password_hash = $1 WHERE localpart = $2"
+
 const selectAccountByLocalpartSQL = "" +
 	"SELECT localpart, appservice_id FROM account_accounts WHERE localpart = $1"
 
@@ -55,12 +58,10 @@ const selectPasswordHashSQL = "" +
 const selectNewNumericLocalpartSQL = "" +
 	"SELECT COUNT(localpart) FROM account_accounts"
 
-// TODO: Update password
-
 type accountsStatements struct {
 	db                            *sql.DB
-	writer                        *sqlutil.TransactionWriter
 	insertAccountStmt             *sql.Stmt
+	updatePasswordStmt            *sql.Stmt
 	selectAccountByLocalpartStmt  *sql.Stmt
 	selectPasswordHashStmt        *sql.Stmt
 	selectNewNumericLocalpartStmt *sql.Stmt
@@ -69,12 +70,15 @@ type accountsStatements struct {
 
 func (s *accountsStatements) prepare(db *sql.DB, server gomatrixserverlib.ServerName) (err error) {
 	s.db = db
-	s.writer = sqlutil.NewTransactionWriter()
+
 	_, err = db.Exec(accountsSchema)
 	if err != nil {
 		return
 	}
 	if s.insertAccountStmt, err = db.Prepare(insertAccountSQL); err != nil {
+		return
+	}
+	if s.updatePasswordStmt, err = db.Prepare(updatePasswordSQL); err != nil {
 		return
 	}
 	if s.selectAccountByLocalpartStmt, err = db.Prepare(selectAccountByLocalpartSQL); err != nil {
@@ -99,15 +103,12 @@ func (s *accountsStatements) insertAccount(
 	createdTimeMS := time.Now().UnixNano() / 1000000
 	stmt := s.insertAccountStmt
 
-	err := s.writer.Do(s.db, txn, func(txn *sql.Tx) error {
-		var err error
-		if appserviceID == "" {
-			_, err = txn.Stmt(stmt).ExecContext(ctx, localpart, createdTimeMS, hash, nil)
-		} else {
-			_, err = txn.Stmt(stmt).ExecContext(ctx, localpart, createdTimeMS, hash, appserviceID)
-		}
-		return err
-	})
+	var err error
+	if appserviceID == "" {
+		_, err = sqlutil.TxStmt(txn, stmt).ExecContext(ctx, localpart, createdTimeMS, hash, nil)
+	} else {
+		_, err = sqlutil.TxStmt(txn, stmt).ExecContext(ctx, localpart, createdTimeMS, hash, appserviceID)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -118,6 +119,13 @@ func (s *accountsStatements) insertAccount(
 		ServerName:   s.serverName,
 		AppServiceID: appserviceID,
 	}, nil
+}
+
+func (s *accountsStatements) updatePassword(
+	ctx context.Context, localpart, passwordHash string,
+) (err error) {
+	_, err = s.updatePasswordStmt.ExecContext(ctx, passwordHash, localpart)
+	return
 }
 
 func (s *accountsStatements) selectPasswordHash(
@@ -156,7 +164,7 @@ func (s *accountsStatements) selectNewNumericLocalpart(
 ) (id int64, err error) {
 	stmt := s.selectNewNumericLocalpartStmt
 	if txn != nil {
-		stmt = txn.Stmt(stmt)
+		stmt = sqlutil.TxStmt(txn, stmt)
 	}
 	err = stmt.QueryRowContext(ctx).Scan(&id)
 	return

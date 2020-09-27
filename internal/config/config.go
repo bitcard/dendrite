@@ -36,6 +36,9 @@ import (
 	jaegermetrics "github.com/uber/jaeger-lib/metrics"
 )
 
+// keyIDRegexp defines allowable characters in Key IDs.
+var keyIDRegexp = regexp.MustCompile("^ed25519:[a-zA-Z0-9_]+$")
+
 // Version is the current version of the config format.
 // This will change whenever we make breaking changes to the config format.
 const Version = 1
@@ -51,19 +54,18 @@ type Dendrite struct {
 	// been a breaking change to the config file format.
 	Version int `yaml:"version"`
 
-	Global             Global             `yaml:"global"`
-	AppServiceAPI      AppServiceAPI      `yaml:"app_service_api"`
-	ClientAPI          ClientAPI          `yaml:"client_api"`
-	CurrentStateServer CurrentStateServer `yaml:"current_state_server"`
-	EDUServer          EDUServer          `yaml:"edu_server"`
-	FederationAPI      FederationAPI      `yaml:"federation_api"`
-	FederationSender   FederationSender   `yaml:"federation_sender"`
-	KeyServer          KeyServer          `yaml:"key_server"`
-	MediaAPI           MediaAPI           `yaml:"media_api"`
-	RoomServer         RoomServer         `yaml:"room_server"`
-	ServerKeyAPI       ServerKeyAPI       `yaml:"server_key_api"`
-	SyncAPI            SyncAPI            `yaml:"sync_api"`
-	UserAPI            UserAPI            `yaml:"user_api"`
+	Global           Global           `yaml:"global"`
+	AppServiceAPI    AppServiceAPI    `yaml:"app_service_api"`
+	ClientAPI        ClientAPI        `yaml:"client_api"`
+	EDUServer        EDUServer        `yaml:"edu_server"`
+	FederationAPI    FederationAPI    `yaml:"federation_api"`
+	FederationSender FederationSender `yaml:"federation_sender"`
+	KeyServer        KeyServer        `yaml:"key_server"`
+	MediaAPI         MediaAPI         `yaml:"media_api"`
+	RoomServer       RoomServer       `yaml:"room_server"`
+	ServerKeyAPI     ServerKeyAPI     `yaml:"server_key_api"`
+	SyncAPI          SyncAPI          `yaml:"sync_api"`
+	UserAPI          UserAPI          `yaml:"user_api"`
 
 	// The config for tracing the dendrite servers.
 	Tracing struct {
@@ -226,8 +228,28 @@ func loadConfig(
 		return nil, err
 	}
 
-	if c.Global.KeyID, c.Global.PrivateKey, err = readKeyPEM(privateKeyPath, privateKeyData); err != nil {
+	if c.Global.KeyID, c.Global.PrivateKey, err = readKeyPEM(privateKeyPath, privateKeyData, true); err != nil {
 		return nil, err
+	}
+
+	for i, oldPrivateKey := range c.Global.OldVerifyKeys {
+		var oldPrivateKeyData []byte
+
+		oldPrivateKeyPath := absPath(basePath, oldPrivateKey.PrivateKeyPath)
+		oldPrivateKeyData, err = readFile(oldPrivateKeyPath)
+		if err != nil {
+			return nil, err
+		}
+
+		// NOTSPEC: Ordinarily we should enforce key ID formatting, but since there are
+		// a number of private keys out there with non-compatible symbols in them due
+		// to lack of validation in Synapse, we won't enforce that for old verify keys.
+		keyID, privateKey, perr := readKeyPEM(oldPrivateKeyPath, oldPrivateKeyData, false)
+		if perr != nil {
+			return nil, perr
+		}
+
+		c.Global.OldVerifyKeys[i].KeyID, c.Global.OldVerifyKeys[i].PrivateKey = keyID, privateKey
 	}
 
 	for _, certPath := range c.FederationAPI.FederationCertificatePaths {
@@ -289,7 +311,6 @@ func (c *Dendrite) Defaults() {
 
 	c.Global.Defaults()
 	c.ClientAPI.Defaults()
-	c.CurrentStateServer.Defaults()
 	c.EDUServer.Defaults()
 	c.FederationAPI.Defaults()
 	c.FederationSender.Defaults()
@@ -309,7 +330,7 @@ func (c *Dendrite) Verify(configErrs *ConfigErrors, isMonolith bool) {
 		Verify(configErrs *ConfigErrors, isMonolith bool)
 	}
 	for _, c := range []verifiable{
-		&c.Global, &c.ClientAPI, &c.CurrentStateServer,
+		&c.Global, &c.ClientAPI,
 		&c.EDUServer, &c.FederationAPI, &c.FederationSender,
 		&c.KeyServer, &c.MediaAPI, &c.RoomServer,
 		&c.ServerKeyAPI, &c.SyncAPI, &c.UserAPI,
@@ -321,7 +342,6 @@ func (c *Dendrite) Verify(configErrs *ConfigErrors, isMonolith bool) {
 
 func (c *Dendrite) Wiring() {
 	c.ClientAPI.Matrix = &c.Global
-	c.CurrentStateServer.Matrix = &c.Global
 	c.EDUServer.Matrix = &c.Global
 	c.FederationAPI.Matrix = &c.Global
 	c.FederationSender.Matrix = &c.Global
@@ -444,7 +464,7 @@ func absPath(dir string, path Path) string {
 	return filepath.Join(dir, string(path))
 }
 
-func readKeyPEM(path string, data []byte) (gomatrixserverlib.KeyID, ed25519.PrivateKey, error) {
+func readKeyPEM(path string, data []byte, enforceKeyIDFormat bool) (gomatrixserverlib.KeyID, ed25519.PrivateKey, error) {
 	for {
 		var keyBlock *pem.Block
 		keyBlock, data = pem.Decode(data)
@@ -461,6 +481,9 @@ func readKeyPEM(path string, data []byte) (gomatrixserverlib.KeyID, ed25519.Priv
 			}
 			if !strings.HasPrefix(keyID, "ed25519:") {
 				return "", nil, fmt.Errorf("key ID %q doesn't start with \"ed25519:\" in %q", keyID, path)
+			}
+			if enforceKeyIDFormat && !keyIDRegexp.MatchString(keyID) {
+				return "", nil, fmt.Errorf("key ID %q in %q contains illegal characters (use a-z, A-Z, 0-9 and _ only)", keyID, path)
 			}
 			_, privKey, err := ed25519.GenerateKey(bytes.NewReader(keyBlock.Bytes))
 			if err != nil {
@@ -510,15 +533,6 @@ func (config *Dendrite) UserAPIURL() string {
 	// People setting up servers shouldn't need to get a certificate valid for the public
 	// internet for an internal API.
 	return string(config.UserAPI.InternalAPI.Connect)
-}
-
-// CurrentStateAPIURL returns an HTTP URL for where the currentstateserver is listening.
-func (config *Dendrite) CurrentStateAPIURL() string {
-	// Hard code the currentstateserver to talk HTTP for now.
-	// If we support HTTPS we need to think of a practical way to do certificate validation.
-	// People setting up servers shouldn't need to get a certificate valid for the public
-	// internet for an internal API.
-	return string(config.CurrentStateServer.InternalAPI.Connect)
 }
 
 // EDUServerURL returns an HTTP URL for where the EDU server is listening.

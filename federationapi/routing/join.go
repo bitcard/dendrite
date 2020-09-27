@@ -29,6 +29,7 @@ import (
 )
 
 // MakeJoin implements the /make_join API
+// nolint:gocyclo
 func MakeJoin(
 	httpReq *http.Request,
 	request *gomatrixserverlib.FederationRequest,
@@ -79,6 +80,29 @@ func MakeJoin(
 		}
 	}
 
+	// Check if we think we are still joined to the room
+	inRoomReq := &api.QueryServerJoinedToRoomRequest{
+		ServerName: cfg.Matrix.ServerName,
+		RoomID:     roomID,
+	}
+	inRoomRes := &api.QueryServerJoinedToRoomResponse{}
+	if err = rsAPI.QueryServerJoinedToRoom(httpReq.Context(), inRoomReq, inRoomRes); err != nil {
+		util.GetLogger(httpReq.Context()).WithError(err).Error("rsAPI.QueryServerJoinedToRoom failed")
+		return jsonerror.InternalServerError()
+	}
+	if !inRoomRes.RoomExists {
+		return util.JSONResponse{
+			Code: http.StatusNotFound,
+			JSON: jsonerror.NotFound(fmt.Sprintf("Room ID %q was not found on this server", roomID)),
+		}
+	}
+	if !inRoomRes.IsInRoom {
+		return util.JSONResponse{
+			Code: http.StatusNotFound,
+			JSON: jsonerror.NotFound(fmt.Sprintf("Room ID %q has no remaining users on this server", roomID)),
+		}
+	}
+
 	// Try building an event for the server
 	builder := gomatrixserverlib.EventBuilder{
 		Sender:   userID,
@@ -95,7 +119,7 @@ func MakeJoin(
 	queryRes := api.QueryLatestEventsAndStateResponse{
 		RoomVersion: verRes.RoomVersion,
 	}
-	event, err := eventutil.BuildEvent(httpReq.Context(), &builder, cfg.Matrix, time.Now(), rsAPI, &queryRes)
+	event, err := eventutil.QueryAndBuildEvent(httpReq.Context(), &builder, cfg.Matrix, time.Now(), rsAPI, &queryRes)
 	if err == eventutil.ErrRoomNoExists {
 		return util.JSONResponse{
 			Code: http.StatusNotFound,
@@ -165,7 +189,7 @@ func SendJoin(
 	}
 
 	// Check that a state key is provided.
-	if event.StateKey() == nil || (event.StateKey() != nil && *event.StateKey() == "") {
+	if event.StateKey() == nil || event.StateKeyEquals("") {
 		return util.JSONResponse{
 			Code: http.StatusBadRequest,
 			JSON: jsonerror.BadJSON(
@@ -253,11 +277,12 @@ func SendJoin(
 	// there isn't much point in sending another join event into the room.
 	alreadyJoined := false
 	for _, se := range stateAndAuthChainResponse.StateEvents {
+		if !se.StateKeyEquals(*event.StateKey()) {
+			continue
+		}
 		if membership, merr := se.Membership(); merr == nil {
-			if se.StateKey() != nil && *se.StateKey() == *event.StateKey() {
-				alreadyJoined = (membership == "join")
-				break
-			}
+			alreadyJoined = (membership == gomatrixserverlib.Join)
+			break
 		}
 	}
 
@@ -265,15 +290,14 @@ func SendJoin(
 	// We are responsible for notifying other servers that the user has joined
 	// the room, so set SendAsServer to cfg.Matrix.ServerName
 	if !alreadyJoined {
-		_, err = api.SendEvents(
+		if err = api.SendEvents(
 			httpReq.Context(), rsAPI,
 			[]gomatrixserverlib.HeaderedEvent{
 				event.Headered(stateAndAuthChainResponse.RoomVersion),
 			},
 			cfg.Matrix.ServerName,
 			nil,
-		)
-		if err != nil {
+		); err != nil {
 			util.GetLogger(httpReq.Context()).WithError(err).Error("SendEvents failed")
 			return jsonerror.InternalServerError()
 		}

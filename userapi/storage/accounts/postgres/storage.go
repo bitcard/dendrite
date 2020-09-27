@@ -34,7 +34,8 @@ import (
 
 // Database represents an account database
 type Database struct {
-	db *sql.DB
+	db     *sql.DB
+	writer sqlutil.Writer
 	sqlutil.PartitionOffsetStatements
 	accounts     accountsStatements
 	profiles     profilesStatements
@@ -49,27 +50,27 @@ func NewDatabase(dbProperties *config.DatabaseOptions, serverName gomatrixserver
 	if err != nil {
 		return nil, err
 	}
-	partitions := sqlutil.PartitionOffsetStatements{}
-	if err = partitions.Prepare(db, "account"); err != nil {
+	d := &Database{
+		serverName: serverName,
+		db:         db,
+		writer:     sqlutil.NewDummyWriter(),
+	}
+	if err = d.PartitionOffsetStatements.Prepare(db, d.writer, "account"); err != nil {
 		return nil, err
 	}
-	a := accountsStatements{}
-	if err = a.prepare(db, serverName); err != nil {
+	if err = d.accounts.prepare(db, serverName); err != nil {
 		return nil, err
 	}
-	p := profilesStatements{}
-	if err = p.prepare(db); err != nil {
+	if err = d.profiles.prepare(db); err != nil {
 		return nil, err
 	}
-	ac := accountDataStatements{}
-	if err = ac.prepare(db); err != nil {
+	if err = d.accountDatas.prepare(db); err != nil {
 		return nil, err
 	}
-	t := threepidStatements{}
-	if err = t.prepare(db); err != nil {
+	if err = d.threepids.prepare(db); err != nil {
 		return nil, err
 	}
-	return &Database{db, partitions, a, p, ac, t, serverName}, nil
+	return d, nil
 }
 
 // GetAccountByPassword returns the account associated with the given localpart and password.
@@ -109,6 +110,17 @@ func (d *Database) SetDisplayName(
 	ctx context.Context, localpart string, displayName string,
 ) error {
 	return d.profiles.setDisplayName(ctx, localpart, displayName)
+}
+
+// SetPassword sets the account password to the given hash.
+func (d *Database) SetPassword(
+	ctx context.Context, localpart, plaintextPassword string,
+) error {
+	hash, err := hashPassword(plaintextPassword)
+	if err != nil {
+		return err
+	}
+	return d.accounts.updatePassword(ctx, localpart, hash)
 }
 
 // CreateGuestAccount makes a new guest account and creates an empty profile

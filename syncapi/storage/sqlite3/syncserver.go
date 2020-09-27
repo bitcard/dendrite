@@ -31,7 +31,8 @@ import (
 // both the database for PDUs and caches for EDUs.
 type SyncServerDatasource struct {
 	shared.Database
-	db *sql.DB
+	db     *sql.DB
+	writer sqlutil.Writer
 	sqlutil.PartitionOffsetStatements
 	streamID streamIDStatements
 }
@@ -44,6 +45,7 @@ func NewDatabase(dbProperties *config.DatabaseOptions) (*SyncServerDatasource, e
 	if d.db, err = sqlutil.Open(dbProperties); err != nil {
 		return nil, err
 	}
+	d.writer = sqlutil.NewExclusiveWriter()
 	if err = d.prepare(); err != nil {
 		return nil, err
 	}
@@ -51,7 +53,7 @@ func NewDatabase(dbProperties *config.DatabaseOptions) (*SyncServerDatasource, e
 }
 
 func (d *SyncServerDatasource) prepare() (err error) {
-	if err = d.PartitionOffsetStatements.Prepare(d.db, "syncapi"); err != nil {
+	if err = d.PartitionOffsetStatements.Prepare(d.db, d.writer, "syncapi"); err != nil {
 		return err
 	}
 	if err = d.streamID.prepare(d.db); err != nil {
@@ -73,6 +75,10 @@ func (d *SyncServerDatasource) prepare() (err error) {
 	if err != nil {
 		return err
 	}
+	peeks, err := NewSqlitePeeksTable(d.db, &d.streamID)
+	if err != nil {
+		return err
+	}
 	topology, err := NewSqliteTopologyTable(d.db)
 	if err != nil {
 		return err
@@ -91,7 +97,9 @@ func (d *SyncServerDatasource) prepare() (err error) {
 	}
 	d.Database = shared.Database{
 		DB:                  d.db,
+		Writer:              d.writer,
 		Invites:             invites,
+		Peeks:               peeks,
 		AccountData:         accountData,
 		OutputEvents:        events,
 		BackwardExtremities: bwExtrem,
@@ -99,7 +107,6 @@ func (d *SyncServerDatasource) prepare() (err error) {
 		Topology:            topology,
 		Filter:              filter,
 		SendToDevice:        sendToDevice,
-		SendToDeviceWriter:  sqlutil.NewTransactionWriter(),
 		EDUCache:            cache.New(),
 	}
 	return nil

@@ -51,7 +51,6 @@ const selectAccountDataByTypeSQL = "" +
 
 type accountDataStatements struct {
 	db                          *sql.DB
-	writer                      *sqlutil.TransactionWriter
 	insertAccountDataStmt       *sql.Stmt
 	selectAccountDataStmt       *sql.Stmt
 	selectAccountDataByTypeStmt *sql.Stmt
@@ -59,7 +58,6 @@ type accountDataStatements struct {
 
 func (s *accountDataStatements) prepare(db *sql.DB) (err error) {
 	s.db = db
-	s.writer = sqlutil.NewTransactionWriter()
 	_, err = db.Exec(accountDataSchema)
 	if err != nil {
 		return
@@ -78,11 +76,9 @@ func (s *accountDataStatements) prepare(db *sql.DB) (err error) {
 
 func (s *accountDataStatements) insertAccountData(
 	ctx context.Context, txn *sql.Tx, localpart, roomID, dataType string, content json.RawMessage,
-) (err error) {
-	return s.writer.Do(s.db, txn, func(txn *sql.Tx) error {
-		_, err := txn.Stmt(s.insertAccountDataStmt).ExecContext(ctx, localpart, roomID, dataType, content)
-		return err
-	})
+) error {
+	_, err := sqlutil.TxStmt(txn, s.insertAccountDataStmt).ExecContext(ctx, localpart, roomID, dataType, content)
+	return err
 }
 
 func (s *accountDataStatements) selectAccountData(

@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	currentstateAPI "github.com/matrix-org/dendrite/currentstateserver/api"
 	eduAPI "github.com/matrix-org/dendrite/eduserver/api"
 	fsAPI "github.com/matrix-org/dendrite/federationsender/api"
 	"github.com/matrix-org/dendrite/internal/test"
@@ -90,25 +89,32 @@ func (t *testRoomserverAPI) InputRoomEvents(
 	ctx context.Context,
 	request *api.InputRoomEventsRequest,
 	response *api.InputRoomEventsResponse,
-) error {
+) {
 	t.inputRoomEvents = append(t.inputRoomEvents, request.InputRoomEvents...)
 	for _, ire := range request.InputRoomEvents {
 		fmt.Println("InputRoomEvents: ", ire.Event.EventID())
 	}
-	return nil
 }
 
 func (t *testRoomserverAPI) PerformInvite(
 	ctx context.Context,
 	req *api.PerformInviteRequest,
 	res *api.PerformInviteResponse,
-) {
+) error {
+	return nil
 }
 
 func (t *testRoomserverAPI) PerformJoin(
 	ctx context.Context,
 	req *api.PerformJoinRequest,
 	res *api.PerformJoinResponse,
+) {
+}
+
+func (t *testRoomserverAPI) PerformPeek(
+	ctx context.Context,
+	req *api.PerformPeekRequest,
+	res *api.PerformPeekResponse,
 ) {
 }
 
@@ -189,6 +195,15 @@ func (t *testRoomserverAPI) QueryMembershipsForRoom(
 	ctx context.Context,
 	request *api.QueryMembershipsForRoomRequest,
 	response *api.QueryMembershipsForRoomResponse,
+) error {
+	return fmt.Errorf("not implemented")
+}
+
+// Query if a server is joined to a room
+func (t *testRoomserverAPI) QueryServerJoinedToRoom(
+	ctx context.Context,
+	request *api.QueryServerJoinedToRoomRequest,
+	response *api.QueryServerJoinedToRoomResponse,
 ) error {
 	return fmt.Errorf("not implemented")
 }
@@ -295,30 +310,27 @@ func (t *testRoomserverAPI) RemoveRoomAlias(
 	return fmt.Errorf("not implemented")
 }
 
-type testStateAPI struct {
-}
-
-func (t *testStateAPI) QueryCurrentState(ctx context.Context, req *currentstateAPI.QueryCurrentStateRequest, res *currentstateAPI.QueryCurrentStateResponse) error {
+func (t *testRoomserverAPI) QueryCurrentState(ctx context.Context, req *api.QueryCurrentStateRequest, res *api.QueryCurrentStateResponse) error {
 	return nil
 }
 
-func (t *testStateAPI) QueryRoomsForUser(ctx context.Context, req *currentstateAPI.QueryRoomsForUserRequest, res *currentstateAPI.QueryRoomsForUserResponse) error {
+func (t *testRoomserverAPI) QueryRoomsForUser(ctx context.Context, req *api.QueryRoomsForUserRequest, res *api.QueryRoomsForUserResponse) error {
 	return fmt.Errorf("not implemented")
 }
 
-func (t *testStateAPI) QueryBulkStateContent(ctx context.Context, req *currentstateAPI.QueryBulkStateContentRequest, res *currentstateAPI.QueryBulkStateContentResponse) error {
+func (t *testRoomserverAPI) QueryBulkStateContent(ctx context.Context, req *api.QueryBulkStateContentRequest, res *api.QueryBulkStateContentResponse) error {
 	return fmt.Errorf("not implemented")
 }
 
-func (t *testStateAPI) QuerySharedUsers(ctx context.Context, req *currentstateAPI.QuerySharedUsersRequest, res *currentstateAPI.QuerySharedUsersResponse) error {
+func (t *testRoomserverAPI) QuerySharedUsers(ctx context.Context, req *api.QuerySharedUsersRequest, res *api.QuerySharedUsersResponse) error {
 	return fmt.Errorf("not implemented")
 }
 
-func (t *testStateAPI) QueryKnownUsers(ctx context.Context, req *currentstateAPI.QueryKnownUsersRequest, res *currentstateAPI.QueryKnownUsersResponse) error {
+func (t *testRoomserverAPI) QueryKnownUsers(ctx context.Context, req *api.QueryKnownUsersRequest, res *api.QueryKnownUsersResponse) error {
 	return fmt.Errorf("not implemented")
 }
 
-func (t *testStateAPI) QueryServerBannedFromRoom(ctx context.Context, req *currentstateAPI.QueryServerBannedFromRoomRequest, res *currentstateAPI.QueryServerBannedFromRoomResponse) error {
+func (t *testRoomserverAPI) QueryServerBannedFromRoom(ctx context.Context, req *api.QueryServerBannedFromRoomRequest, res *api.QueryServerBannedFromRoomResponse) error {
 	return nil
 }
 
@@ -366,12 +378,10 @@ func (c *txnFedClient) LookupMissingEvents(ctx context.Context, s gomatrixserver
 	return c.getMissingEvents(missing)
 }
 
-func mustCreateTransaction(rsAPI api.RoomserverInternalAPI, stateAPI currentstateAPI.CurrentStateInternalAPI, fedClient txnFederationClient, pdus []json.RawMessage) *txnReq {
+func mustCreateTransaction(rsAPI api.RoomserverInternalAPI, fedClient txnFederationClient, pdus []json.RawMessage) *txnReq {
 	t := &txnReq{
-		context:    context.Background(),
 		rsAPI:      rsAPI,
 		eduAPI:     &testEDUProducer{},
-		stateAPI:   stateAPI,
 		keys:       &test.NopJSONVerifier{},
 		federation: fedClient,
 		haveEvents: make(map[string]*gomatrixserverlib.HeaderedEvent),
@@ -385,7 +395,7 @@ func mustCreateTransaction(rsAPI api.RoomserverInternalAPI, stateAPI currentstat
 }
 
 func mustProcessTransaction(t *testing.T, txn *txnReq, pdusWithErrors []string) {
-	res, err := txn.processTransaction()
+	res, err := txn.processTransaction(context.Background())
 	if err != nil {
 		t.Errorf("txn.processTransaction returned an error: %v", err)
 		return
@@ -451,16 +461,16 @@ func TestBasicTransaction(t *testing.T) {
 			}
 		},
 	}
-	stateAPI := &testStateAPI{}
 	pdus := []json.RawMessage{
 		testData[len(testData)-1], // a message event
 	}
-	txn := mustCreateTransaction(rsAPI, stateAPI, &txnFedClient{}, pdus)
+	txn := mustCreateTransaction(rsAPI, &txnFedClient{}, pdus)
 	mustProcessTransaction(t, txn, nil)
 	assertInputRoomEvents(t, rsAPI.inputRoomEvents, []gomatrixserverlib.HeaderedEvent{testEvents[len(testEvents)-1]})
 }
 
-// The purpose of this test is to check that if the event received fails auth checks the transaction is failed.
+// The purpose of this test is to check that if the event received fails auth checks the event is still sent to the roomserver
+// as it does the auth check.
 func TestTransactionFailAuthChecks(t *testing.T) {
 	rsAPI := &testRoomserverAPI{
 		queryStateAfterEvents: func(req *api.QueryStateAfterEventsRequest) api.QueryStateAfterEventsResponse {
@@ -474,16 +484,13 @@ func TestTransactionFailAuthChecks(t *testing.T) {
 			}
 		},
 	}
-	stateAPI := &testStateAPI{}
 	pdus := []json.RawMessage{
 		testData[len(testData)-1], // a message event
 	}
-	txn := mustCreateTransaction(rsAPI, stateAPI, &txnFedClient{}, pdus)
-	mustProcessTransaction(t, txn, []string{
-		// expect the event to have an error
-		testEvents[len(testEvents)-1].EventID(),
-	})
-	assertInputRoomEvents(t, rsAPI.inputRoomEvents, nil) // expect no messages to be sent to the roomserver
+	txn := mustCreateTransaction(rsAPI, &txnFedClient{}, pdus)
+	mustProcessTransaction(t, txn, []string{})
+	// expect message to be sent to the roomserver
+	assertInputRoomEvents(t, rsAPI.inputRoomEvents, []gomatrixserverlib.HeaderedEvent{testEvents[len(testEvents)-1]})
 }
 
 // The purpose of this test is to make sure that when an event is received for which we do not know the prev_events,
@@ -533,8 +540,6 @@ func TestTransactionFetchMissingPrevEvents(t *testing.T) {
 		},
 	}
 
-	stateAPI := &testStateAPI{}
-
 	cli := &txnFedClient{
 		getMissingEvents: func(missing gomatrixserverlib.MissingEvents) (res gomatrixserverlib.RespMissingEvents, err error) {
 			if !reflect.DeepEqual(missing.EarliestEvents, []string{haveEvent.EventID()}) {
@@ -554,7 +559,7 @@ func TestTransactionFetchMissingPrevEvents(t *testing.T) {
 	pdus := []json.RawMessage{
 		inputEvent.JSON(),
 	}
-	txn := mustCreateTransaction(rsAPI, stateAPI, cli, pdus)
+	txn := mustCreateTransaction(rsAPI, cli, pdus)
 	mustProcessTransaction(t, txn, nil)
 	assertInputRoomEvents(t, rsAPI.inputRoomEvents, []gomatrixserverlib.HeaderedEvent{prevEvent, inputEvent})
 }
@@ -704,12 +709,10 @@ func TestTransactionFetchMissingStateByStateIDs(t *testing.T) {
 		},
 	}
 
-	stateAPI := &testStateAPI{}
-
 	pdus := []json.RawMessage{
 		eventD.JSON(),
 	}
-	txn := mustCreateTransaction(rsAPI, stateAPI, cli, pdus)
+	txn := mustCreateTransaction(rsAPI, cli, pdus)
 	mustProcessTransaction(t, txn, nil)
 	assertInputRoomEvents(t, rsAPI.inputRoomEvents, []gomatrixserverlib.HeaderedEvent{eventB, eventC, eventD})
 }

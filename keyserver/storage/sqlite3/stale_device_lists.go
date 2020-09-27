@@ -49,13 +49,16 @@ const selectStaleDeviceListsSQL = "" +
 	"SELECT user_id FROM keyserver_stale_device_lists WHERE is_stale = $1"
 
 type staleDeviceListsStatements struct {
+	db                                    *sql.DB
 	upsertStaleDeviceListStmt             *sql.Stmt
 	selectStaleDeviceListsWithDomainsStmt *sql.Stmt
 	selectStaleDeviceListsStmt            *sql.Stmt
 }
 
 func NewSqliteStaleDeviceListsTable(db *sql.DB) (tables.StaleDeviceLists, error) {
-	s := &staleDeviceListsStatements{}
+	s := &staleDeviceListsStatements{
+		db: db,
+	}
 	_, err := db.Exec(staleDeviceListsSchema)
 	if err != nil {
 		return nil, err

@@ -38,23 +38,16 @@ func AddInternalRoutes(router *mux.Router, intAPI api.RoomserverInternalAPI) {
 func NewInternalAPI(
 	base *setup.BaseDendrite,
 	keyRing gomatrixserverlib.JSONVerifier,
-	fedClient *gomatrixserverlib.FederationClient,
 ) api.RoomserverInternalAPI {
 	cfg := &base.Cfg.RoomServer
 
-	roomserverDB, err := storage.Open(&cfg.Database)
+	roomserverDB, err := storage.Open(&cfg.Database, base.Caches)
 	if err != nil {
 		logrus.WithError(err).Panicf("failed to connect to room server db")
 	}
 
-	return &internal.RoomserverInternalAPI{
-		DB:                   roomserverDB,
-		Cfg:                  cfg,
-		Producer:             base.KafkaProducer,
-		OutputRoomEventTopic: string(cfg.Matrix.Kafka.TopicFor(config.TopicOutputRoomEvent)),
-		Cache:                base.Caches,
-		ServerName:           cfg.Matrix.ServerName,
-		FedClient:            fedClient,
-		KeyRing:              keyRing,
-	}
+	return internal.NewRoomserverAPI(
+		cfg, roomserverDB, base.KafkaProducer, string(cfg.Matrix.Kafka.TopicFor(config.TopicOutputRoomEvent)),
+		base.Caches, keyRing,
+	)
 }

@@ -54,7 +54,6 @@ const deleteThreePIDSQL = "" +
 
 type threepidStatements struct {
 	db                              *sql.DB
-	writer                          *sqlutil.TransactionWriter
 	selectLocalpartForThreePIDStmt  *sql.Stmt
 	selectThreePIDsForLocalpartStmt *sql.Stmt
 	insertThreePIDStmt              *sql.Stmt
@@ -63,7 +62,6 @@ type threepidStatements struct {
 
 func (s *threepidStatements) prepare(db *sql.DB) (err error) {
 	s.db = db
-	s.writer = sqlutil.NewTransactionWriter()
 	_, err = db.Exec(threepidSchema)
 	if err != nil {
 		return
@@ -122,18 +120,14 @@ func (s *threepidStatements) selectThreePIDsForLocalpart(
 func (s *threepidStatements) insertThreePID(
 	ctx context.Context, txn *sql.Tx, threepid, medium, localpart string,
 ) (err error) {
-	return s.writer.Do(s.db, txn, func(txn *sql.Tx) error {
-		stmt := sqlutil.TxStmt(txn, s.insertThreePIDStmt)
-		_, err := stmt.ExecContext(ctx, threepid, medium, localpart)
-		return err
-	})
+	stmt := sqlutil.TxStmt(txn, s.insertThreePIDStmt)
+	_, err = stmt.ExecContext(ctx, threepid, medium, localpart)
+	return err
 }
 
 func (s *threepidStatements) deleteThreePID(
-	ctx context.Context, threepid string, medium string) (err error) {
-	return s.writer.Do(s.db, nil, func(txn *sql.Tx) error {
-		stmt := sqlutil.TxStmt(txn, s.deleteThreePIDStmt)
-		_, err := stmt.ExecContext(ctx, threepid, medium)
-		return err
-	})
+	ctx context.Context, txn *sql.Tx, threepid string, medium string) (err error) {
+	stmt := sqlutil.TxStmt(txn, s.deleteThreePIDStmt)
+	_, err = stmt.ExecContext(ctx, threepid, medium)
+	return err
 }

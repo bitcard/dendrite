@@ -43,6 +43,7 @@ func NewDatabase(dbProperties *config.DatabaseOptions) (*shared.Database, error)
 	}
 	return &shared.Database{
 		DB:                    db,
+		Writer:                sqlutil.NewExclusiveWriter(),
 		OneTimeKeysTable:      otk,
 		DeviceKeysTable:       dk,
 		KeyChangesTable:       kc,

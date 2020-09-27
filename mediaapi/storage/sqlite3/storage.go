@@ -31,16 +31,19 @@ import (
 type Database struct {
 	statements statements
 	db         *sql.DB
+	writer     sqlutil.Writer
 }
 
 // Open opens a postgres database.
 func Open(dbProperties *config.DatabaseOptions) (*Database, error) {
-	var d Database
+	d := Database{
+		writer: sqlutil.NewExclusiveWriter(),
+	}
 	var err error
 	if d.db, err = sqlutil.Open(dbProperties); err != nil {
 		return nil, err
 	}
-	if err = d.statements.prepare(d.db); err != nil {
+	if err = d.statements.prepare(d.db, d.writer); err != nil {
 		return nil, err
 	}
 	return &d, nil
@@ -61,6 +64,19 @@ func (d *Database) GetMediaMetadata(
 	ctx context.Context, mediaID types.MediaID, mediaOrigin gomatrixserverlib.ServerName,
 ) (*types.MediaMetadata, error) {
 	mediaMetadata, err := d.statements.media.selectMedia(ctx, mediaID, mediaOrigin)
+	if err != nil && err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return mediaMetadata, err
+}
+
+// GetMediaMetadataByHash returns metadata about media stored on this server.
+// The media could have been uploaded to this server or fetched from another server and cached here.
+// Returns nil metadata if there is no metadata associated with this media.
+func (d *Database) GetMediaMetadataByHash(
+	ctx context.Context, mediaHash types.Base64Hash, mediaOrigin gomatrixserverlib.ServerName,
+) (*types.MediaMetadata, error) {
+	mediaMetadata, err := d.statements.media.selectMediaByHash(ctx, mediaHash, mediaOrigin)
 	if err != nil && err == sql.ErrNoRows {
 		return nil, nil
 	}

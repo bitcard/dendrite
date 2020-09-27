@@ -15,12 +15,14 @@
 package sqlutil
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"runtime"
+	"strings"
 
-	"go.uber.org/atomic"
+	"github.com/matrix-org/util"
 )
 
 // ErrUserExists is returned if a username already exists in the database.
@@ -40,9 +42,18 @@ type Transaction interface {
 // was applied correctly. For example, 'database is locked' errors in sqlite will happen here.
 func EndTransaction(txn Transaction, succeeded *bool) error {
 	if *succeeded {
-		return txn.Commit() // nolint: errcheck
+		return txn.Commit()
 	} else {
-		return txn.Rollback() // nolint: errcheck
+		return txn.Rollback()
+	}
+}
+
+// EndTransactionWithCheck ends a transaction and overwrites the error pointer if its value was nil.
+// If the transaction succeeded then it is committed, otherwise it is rolledback.
+// Designed to be used with defer (see EndTransaction otherwise).
+func EndTransactionWithCheck(txn Transaction, succeeded *bool, err *error) {
+	if e := EndTransaction(txn, succeeded); e != nil && *err == nil {
+		*err = e
 	}
 }
 
@@ -52,15 +63,10 @@ func EndTransaction(txn Transaction, succeeded *bool) error {
 func WithTransaction(db *sql.DB, fn func(txn *sql.Tx) error) (err error) {
 	txn, err := db.Begin()
 	if err != nil {
-		return
+		return fmt.Errorf("sqlutil.WithTransaction.Begin: %w", err)
 	}
 	succeeded := false
-	defer func() {
-		err2 := EndTransaction(txn, &succeeded)
-		if err == nil && err2 != nil { // failed to commit/rollback
-			err = err2
-		}
-	}()
+	defer EndTransactionWithCheck(txn, &succeeded, &err)
 
 	err = fn(txn)
 	if err != nil {
@@ -78,6 +84,14 @@ func WithTransaction(db *sql.DB, fn func(txn *sql.Tx) error) (err error) {
 func TxStmt(transaction *sql.Tx, statement *sql.Stmt) *sql.Stmt {
 	if transaction != nil {
 		statement = transaction.Stmt(statement)
+	}
+	return statement
+}
+
+// TxStmtContext behaves similarly to TxStmt, with support for also passing context.
+func TxStmtContext(context context.Context, transaction *sql.Tx, statement *sql.Stmt) *sql.Stmt {
+	if transaction != nil {
+		statement = transaction.StmtContext(context, statement)
 	}
 	return statement
 }
@@ -106,69 +120,43 @@ func SQLiteDriverName() string {
 	return "sqlite3"
 }
 
-// TransactionWriter allows queuing database writes so that you don't
-// contend on database locks in, e.g. SQLite. Only one task will run
-// at a time on a given TransactionWriter.
-type TransactionWriter struct {
-	running atomic.Bool
-	todo    chan transactionWriterTask
+func minOfInts(a, b int) int {
+	if a <= b {
+		return a
+	}
+	return b
 }
 
-func NewTransactionWriter() *TransactionWriter {
-	return &TransactionWriter{
-		todo: make(chan transactionWriterTask),
-	}
+// QueryProvider defines the interface for querys used by RunLimitedVariablesQuery.
+type QueryProvider interface {
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
 }
 
-// transactionWriterTask represents a specific task.
-type transactionWriterTask struct {
-	db   *sql.DB
-	txn  *sql.Tx
-	f    func(txn *sql.Tx) error
-	wait chan error
-}
+// SQLite3MaxVariables is the default maximum number of host parameters in a single SQL statement
+// SQLlite can handle. See https://www.sqlite.org/limits.html for more information.
+const SQLite3MaxVariables = 999
 
-// Do queues a task to be run by a TransactionWriter. The function
-// provided will be ran within a transaction as supplied by the
-// txn parameter if one is supplied, and if not, will take out a
-// new transaction from the database supplied in the database
-// parameter. Either way, this will block until the task is done.
-func (w *TransactionWriter) Do(db *sql.DB, txn *sql.Tx, f func(txn *sql.Tx) error) error {
-	if w.todo == nil {
-		return errors.New("not initialised")
-	}
-	if !w.running.Load() {
-		go w.run()
-	}
-	task := transactionWriterTask{
-		db:   db,
-		txn:  txn,
-		f:    f,
-		wait: make(chan error, 1),
-	}
-	w.todo <- task
-	return <-task.wait
-}
-
-// run processes the tasks for a given transaction writer. Only one
-// of these goroutines will run at a time. A transaction will be
-// opened using the database object from the task and then this will
-// be passed as a parameter to the task function.
-func (w *TransactionWriter) run() {
-	if !w.running.CAS(false, true) {
-		return
-	}
-	defer w.running.Store(false)
-	for task := range w.todo {
-		if task.txn != nil {
-			task.wait <- task.f(task.txn)
-		} else if task.db != nil {
-			task.wait <- WithTransaction(task.db, func(txn *sql.Tx) error {
-				return task.f(txn)
-			})
-		} else {
-			panic("expected database or transaction but got neither")
+// RunLimitedVariablesQuery split up a query with more variables than the used database can handle in multiple queries.
+func RunLimitedVariablesQuery(ctx context.Context, query string, qp QueryProvider, variables []interface{}, limit uint, rowHandler func(*sql.Rows) error) error {
+	var start int
+	for start < len(variables) {
+		n := minOfInts(len(variables)-start, int(limit))
+		nextQuery := strings.Replace(query, "($1)", QueryVariadic(n), 1)
+		rows, err := qp.QueryContext(ctx, nextQuery, variables[start:start+n]...)
+		if err != nil {
+			util.GetLogger(ctx).WithError(err).Error("QueryContext returned an error")
+			return err
 		}
-		close(task.wait)
+		err = rowHandler(rows)
+		if closeErr := rows.Close(); closeErr != nil {
+			util.GetLogger(ctx).WithError(closeErr).Error("RunLimitedVariablesQuery: failed to close rows")
+			return err
+		}
+		if err != nil {
+			util.GetLogger(ctx).WithError(err).Error("RunLimitedVariablesQuery: rowHandler returned error")
+			return err
+		}
+		start = start + n
 	}
+	return nil
 }

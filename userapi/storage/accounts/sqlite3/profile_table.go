@@ -53,7 +53,6 @@ const selectProfilesBySearchSQL = "" +
 
 type profilesStatements struct {
 	db                           *sql.DB
-	writer                       *sqlutil.TransactionWriter
 	insertProfileStmt            *sql.Stmt
 	selectProfileByLocalpartStmt *sql.Stmt
 	setAvatarURLStmt             *sql.Stmt
@@ -63,7 +62,6 @@ type profilesStatements struct {
 
 func (s *profilesStatements) prepare(db *sql.DB) (err error) {
 	s.db = db
-	s.writer = sqlutil.NewTransactionWriter()
 	_, err = db.Exec(profilesSchema)
 	if err != nil {
 		return
@@ -88,11 +86,9 @@ func (s *profilesStatements) prepare(db *sql.DB) (err error) {
 
 func (s *profilesStatements) insertProfile(
 	ctx context.Context, txn *sql.Tx, localpart string,
-) (err error) {
-	return s.writer.Do(s.db, txn, func(txn *sql.Tx) error {
-		_, err := txn.Stmt(s.insertProfileStmt).ExecContext(ctx, localpart, "", "")
-		return err
-	})
+) error {
+	_, err := sqlutil.TxStmt(txn, s.insertProfileStmt).ExecContext(ctx, localpart, "", "")
+	return err
 }
 
 func (s *profilesStatements) selectProfileByLocalpart(
@@ -109,16 +105,18 @@ func (s *profilesStatements) selectProfileByLocalpart(
 }
 
 func (s *profilesStatements) setAvatarURL(
-	ctx context.Context, localpart string, avatarURL string,
+	ctx context.Context, txn *sql.Tx, localpart string, avatarURL string,
 ) (err error) {
-	_, err = s.setAvatarURLStmt.ExecContext(ctx, avatarURL, localpart)
+	stmt := sqlutil.TxStmt(txn, s.setAvatarURLStmt)
+	_, err = stmt.ExecContext(ctx, avatarURL, localpart)
 	return
 }
 
 func (s *profilesStatements) setDisplayName(
-	ctx context.Context, localpart string, displayName string,
+	ctx context.Context, txn *sql.Tx, localpart string, displayName string,
 ) (err error) {
-	_, err = s.setDisplayNameStmt.ExecContext(ctx, displayName, localpart)
+	stmt := sqlutil.TxStmt(txn, s.setDisplayNameStmt)
+	_, err = stmt.ExecContext(ctx, displayName, localpart)
 	return
 }
 

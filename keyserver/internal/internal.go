@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	fedsenderapi "github.com/matrix-org/dendrite/federationsender/api"
 	"github.com/matrix-org/dendrite/keyserver/api"
 	"github.com/matrix-org/dendrite/keyserver/producers"
 	"github.com/matrix-org/dendrite/keyserver/storage"
@@ -36,7 +37,7 @@ import (
 type KeyInternalAPI struct {
 	DB         storage.Database
 	ThisServer gomatrixserverlib.ServerName
-	FedClient  *gomatrixserverlib.FederationClient
+	FedClient  fedsenderapi.FederationClient
 	UserAPI    userapi.UserInternalAPI
 	Producer   *producers.KeyChange
 	Updater    *DeviceListUpdater
@@ -505,7 +506,7 @@ func (a *KeyInternalAPI) uploadLocalDeviceKeys(ctx context.Context, req *api.Per
 		}
 		return
 	}
-	err = a.emitDeviceKeyChanges(existingKeys, keysToStore)
+	err = emitDeviceKeyChanges(a.Producer, existingKeys, keysToStore)
 	if err != nil {
 		util.GetLogger(ctx).Errorf("Failed to emitDeviceKeyChanges: %s", err)
 	}
@@ -550,7 +551,7 @@ func (a *KeyInternalAPI) uploadOneTimeKeys(ctx context.Context, req *api.Perform
 
 }
 
-func (a *KeyInternalAPI) emitDeviceKeyChanges(existing, new []api.DeviceMessage) error {
+func emitDeviceKeyChanges(producer KeyChangeProducer, existing, new []api.DeviceMessage) error {
 	// find keys in new that are not in existing
 	var keysAdded []api.DeviceMessage
 	for _, newKey := range new {
@@ -567,7 +568,7 @@ func (a *KeyInternalAPI) emitDeviceKeyChanges(existing, new []api.DeviceMessage)
 			keysAdded = append(keysAdded, newKey)
 		}
 	}
-	return a.Producer.ProduceKeyChanges(keysAdded)
+	return producer.ProduceKeyChanges(keysAdded)
 }
 
 func appendDisplayNames(existing, new []api.DeviceMessage) []api.DeviceMessage {

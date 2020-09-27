@@ -67,7 +67,7 @@ const (
 
 type eventsStatements struct {
 	db                                     *sql.DB
-	writer                                 *sqlutil.TransactionWriter
+	writer                                 sqlutil.Writer
 	selectEventsByApplicationServiceIDStmt *sql.Stmt
 	countEventsByApplicationServiceIDStmt  *sql.Stmt
 	insertEventStmt                        *sql.Stmt
@@ -75,9 +75,9 @@ type eventsStatements struct {
 	deleteEventsBeforeAndIncludingIDStmt   *sql.Stmt
 }
 
-func (s *eventsStatements) prepare(db *sql.DB) (err error) {
+func (s *eventsStatements) prepare(db *sql.DB, writer sqlutil.Writer) (err error) {
 	s.db = db
-	s.writer = sqlutil.NewTransactionWriter()
+	s.writer = writer
 	_, err = db.Exec(appserviceEventsSchema)
 	if err != nil {
 		return
@@ -116,25 +116,32 @@ func (s *eventsStatements) selectEventsByApplicationServiceID(
 	eventsRemaining bool,
 	err error,
 ) {
-	// Retrieve events from the database. Unsuccessfully sent events first
-	eventRows, err := s.selectEventsByApplicationServiceIDStmt.QueryContext(ctx, applicationServiceID)
-	if err != nil {
-		return
-	}
 	defer func() {
-		err = eventRows.Close()
 		if err != nil {
 			log.WithFields(log.Fields{
 				"appservice": applicationServiceID,
 			}).WithError(err).Fatalf("appservice unable to select new events to send")
 		}
 	}()
+	// Retrieve events from the database. Unsuccessfully sent events first
+	eventRows, err := s.selectEventsByApplicationServiceIDStmt.QueryContext(ctx, applicationServiceID)
+	if err != nil {
+		return
+	}
+	defer checkNamedErr(eventRows.Close, &err)
 	events, maxID, txnID, eventsRemaining, err = retrieveEvents(eventRows, limit)
 	if err != nil {
 		return
 	}
 
 	return
+}
+
+// checkNamedErr calls fn and overwrite err if it was nil and fn returned non-nil
+func checkNamedErr(fn func() error, err *error) {
+	if e := fn(); e != nil && *err == nil {
+		*err = e
+	}
 }
 
 func retrieveEvents(eventRows *sql.Rows, limit int) (events []gomatrixserverlib.HeaderedEvent, maxID, txnID int, eventsRemaining bool, err error) {

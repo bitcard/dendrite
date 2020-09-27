@@ -418,10 +418,10 @@ Inbound federation rejects attempts to join v2 rooms from servers only supportin
 Outbound federation passes make_join failures through to the client
 Outbound federation correctly handles unsupported room versions
 Remote users may not join unfederated rooms
-Guest users denied access over federation if guest access prohibited
 Non-numeric ports in server names are rejected
 Invited user can reject invite over federation
 Invited user can reject invite over federation for empty room
+Invited user can reject invite over federation several times
 Can reject invites over federation for rooms with version 1
 Can reject invites over federation for rooms with version 2
 Can reject invites over federation for rooms with version 3
@@ -454,3 +454,29 @@ Banned servers cannot get missing events
 Banned servers cannot get room state ids
 Banned servers cannot backfill
 Inbound /v1/send_leave rejects leaves from other servers
+Guest users can accept invites to private rooms over federation
+AS user (not ghost) can join room without registering
+If user leaves room, remote user changes device and rejoins we see update in /sync and /keys/changes
+Can search public room list
+Can get remote public room list
+Asking for a remote rooms list, but supplying the local server's name, returns the local rooms list
+After changing password, can't log in with old password
+After changing password, can log in with new password
+After changing password, existing session still works
+After changing password, different sessions can optionally be kept
+After changing password, a different session no longer works by default
+Local users can peek into world_readable rooms by room ID
+We can't peek into rooms with shared history_visibility
+We can't peek into rooms with invited history_visibility
+We can't peek into rooms with joined history_visibility
+Local users can peek by room alias
+Peeked rooms only turn up in the sync for the device who peeked them
+Room state at a rejected message event is the same as its predecessor
+Room state at a rejected state event is the same as its predecessor
+Inbound federation correctly soft fails events
+Inbound federation accepts a second soft-failed event
+Federation key API can act as a notary server via a POST request
+Federation key API can act as a notary server via a GET request
+Inbound /make_join rejects attempts to join rooms where all users have left
+Inbound federation rejects invites which include invalid JSON for room version 6
+Inbound federation rejects invite rejections which include invalid JSON for room version 6

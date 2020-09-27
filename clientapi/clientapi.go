@@ -21,7 +21,6 @@ import (
 	"github.com/matrix-org/dendrite/clientapi/api"
 	"github.com/matrix-org/dendrite/clientapi/producers"
 	"github.com/matrix-org/dendrite/clientapi/routing"
-	currentstateAPI "github.com/matrix-org/dendrite/currentstateserver/api"
 	eduServerAPI "github.com/matrix-org/dendrite/eduserver/api"
 	federationSenderAPI "github.com/matrix-org/dendrite/federationsender/api"
 	"github.com/matrix-org/dendrite/internal/config"
@@ -30,7 +29,6 @@ import (
 	roomserverAPI "github.com/matrix-org/dendrite/roomserver/api"
 	userapi "github.com/matrix-org/dendrite/userapi/api"
 	"github.com/matrix-org/dendrite/userapi/storage/accounts"
-	"github.com/matrix-org/dendrite/userapi/storage/devices"
 	"github.com/matrix-org/gomatrixserverlib"
 )
 
@@ -39,13 +37,11 @@ func AddPublicRoutes(
 	router *mux.Router,
 	cfg *config.ClientAPI,
 	producer sarama.SyncProducer,
-	deviceDB devices.Database,
 	accountsDB accounts.Database,
 	federation *gomatrixserverlib.FederationClient,
 	rsAPI roomserverAPI.RoomserverInternalAPI,
 	eduInputAPI eduServerAPI.EDUServerInputAPI,
 	asAPI appserviceAPI.AppServiceQueryAPI,
-	stateAPI currentstateAPI.CurrentStateInternalAPI,
 	transactionsCache *transactions.Cache,
 	fsAPI federationSenderAPI.FederationSenderInternalAPI,
 	userAPI userapi.UserInternalAPI,
@@ -59,7 +55,7 @@ func AddPublicRoutes(
 
 	routing.Setup(
 		router, cfg, eduInputAPI, rsAPI, asAPI,
-		accountsDB, deviceDB, userAPI, federation,
-		syncProducer, transactionsCache, fsAPI, stateAPI, keyAPI, extRoomsProvider,
+		accountsDB, userAPI, federation,
+		syncProducer, transactionsCache, fsAPI, keyAPI, extRoomsProvider,
 	)
 }

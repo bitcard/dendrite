@@ -2,14 +2,43 @@ package api
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	"github.com/matrix-org/dendrite/federationsender/types"
 	"github.com/matrix-org/gomatrix"
 	"github.com/matrix-org/gomatrixserverlib"
 )
 
+// FederationClient is a subset of gomatrixserverlib.FederationClient functions which the fedsender
+// implements as proxy calls, with built-in backoff/retries/etc. Errors returned from functions in
+// this interface are of type FederationClientError
+type FederationClient interface {
+	gomatrixserverlib.BackfillClient
+	gomatrixserverlib.FederatedStateClient
+	GetUserDevices(ctx context.Context, s gomatrixserverlib.ServerName, userID string) (res gomatrixserverlib.RespUserDevices, err error)
+	ClaimKeys(ctx context.Context, s gomatrixserverlib.ServerName, oneTimeKeys map[string]map[string]string) (res gomatrixserverlib.RespClaimKeys, err error)
+	QueryKeys(ctx context.Context, s gomatrixserverlib.ServerName, keys map[string][]string) (res gomatrixserverlib.RespQueryKeys, err error)
+	GetEvent(ctx context.Context, s gomatrixserverlib.ServerName, eventID string) (res gomatrixserverlib.Transaction, err error)
+	GetServerKeys(ctx context.Context, matrixServer gomatrixserverlib.ServerName) (gomatrixserverlib.ServerKeys, error)
+	LookupServerKeys(ctx context.Context, s gomatrixserverlib.ServerName, keyRequests map[gomatrixserverlib.PublicKeyLookupRequest]gomatrixserverlib.Timestamp) ([]gomatrixserverlib.ServerKeys, error)
+}
+
+// FederationClientError is returned from FederationClient methods in the event of a problem.
+type FederationClientError struct {
+	Err         string
+	RetryAfter  time.Duration
+	Blacklisted bool
+}
+
+func (e *FederationClientError) Error() string {
+	return fmt.Sprintf("%s - (retry_after=%s, blacklisted=%v)", e.Err, e.RetryAfter.String(), e.Blacklisted)
+}
+
 // FederationSenderInternalAPI is used to query information from the federation sender.
 type FederationSenderInternalAPI interface {
+	FederationClient
+
 	// PerformDirectoryLookup looks up a remote room ID from a room alias.
 	PerformDirectoryLookup(
 		ctx context.Context,
@@ -35,6 +64,12 @@ type FederationSenderInternalAPI interface {
 		ctx context.Context,
 		request *PerformLeaveRequest,
 		response *PerformLeaveResponse,
+	) error
+	// Handle sending an invite to a remote server.
+	PerformInvite(
+		ctx context.Context,
+		request *PerformInviteRequest,
+		response *PerformInviteResponse,
 	) error
 	// Notifies the federation sender that these servers may be online and to retry sending messages.
 	PerformServersAlive(
@@ -79,6 +114,16 @@ type PerformLeaveRequest struct {
 }
 
 type PerformLeaveResponse struct {
+}
+
+type PerformInviteRequest struct {
+	RoomVersion     gomatrixserverlib.RoomVersion             `json:"room_version"`
+	Event           gomatrixserverlib.HeaderedEvent           `json:"event"`
+	InviteRoomState []gomatrixserverlib.InviteV2StrippedState `json:"invite_room_state"`
+}
+
+type PerformInviteResponse struct {
+	Event gomatrixserverlib.HeaderedEvent `json:"event"`
 }
 
 type PerformServersAliveRequest struct {
