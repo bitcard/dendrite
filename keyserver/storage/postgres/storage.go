@@ -15,14 +15,15 @@
 package postgres
 
 import (
+	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/sqlutil"
 	"github.com/matrix-org/dendrite/keyserver/storage/shared"
 )
 
 // NewDatabase creates a new sync server database
-func NewDatabase(dbDataSourceName string, dbProperties sqlutil.DbProperties) (*shared.Database, error) {
+func NewDatabase(dbProperties *config.DatabaseOptions) (*shared.Database, error) {
 	var err error
-	db, err := sqlutil.Open("postgres", dbDataSourceName, dbProperties)
+	db, err := sqlutil.Open(dbProperties)
 	if err != nil {
 		return nil, err
 	}
@@ -38,10 +39,16 @@ func NewDatabase(dbDataSourceName string, dbProperties sqlutil.DbProperties) (*s
 	if err != nil {
 		return nil, err
 	}
+	sdl, err := NewPostgresStaleDeviceListsTable(db)
+	if err != nil {
+		return nil, err
+	}
 	return &shared.Database{
-		DB:               db,
-		OneTimeKeysTable: otk,
-		DeviceKeysTable:  dk,
-		KeyChangesTable:  kc,
+		DB:                    db,
+		Writer:                sqlutil.NewDummyWriter(),
+		OneTimeKeysTable:      otk,
+		DeviceKeysTable:       dk,
+		KeyChangesTable:       kc,
+		StaleDeviceListsTable: sdl,
 	}, nil
 }

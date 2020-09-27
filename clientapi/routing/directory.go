@@ -20,7 +20,6 @@ import (
 
 	"github.com/matrix-org/dendrite/clientapi/httputil"
 	"github.com/matrix-org/dendrite/clientapi/jsonerror"
-	currentstateAPI "github.com/matrix-org/dendrite/currentstateserver/api"
 	federationSenderAPI "github.com/matrix-org/dendrite/federationsender/api"
 	"github.com/matrix-org/dendrite/internal/config"
 	roomserverAPI "github.com/matrix-org/dendrite/roomserver/api"
@@ -47,7 +46,7 @@ func DirectoryRoom(
 	req *http.Request,
 	roomAlias string,
 	federation *gomatrixserverlib.FederationClient,
-	cfg *config.Dendrite,
+	cfg *config.ClientAPI,
 	rsAPI roomserverAPI.RoomserverInternalAPI,
 	fedSenderAPI federationSenderAPI.FederationSenderInternalAPI,
 ) util.JSONResponse {
@@ -116,7 +115,7 @@ func SetLocalAlias(
 	req *http.Request,
 	device *api.Device,
 	alias string,
-	cfg *config.Dendrite,
+	cfg *config.ClientAPI,
 	aliasAPI roomserverAPI.RoomserverInternalAPI,
 ) util.JSONResponse {
 	_, domain, err := gomatrixserverlib.SplitID('#', alias)
@@ -139,6 +138,7 @@ func SetLocalAlias(
 	// TODO: This code should eventually be refactored with:
 	// 1. The new method for checking for things matching an AS's namespace
 	// 2. Using an overall Regex object for all AS's just like we did for usernames
+
 	for _, appservice := range cfg.Derived.ApplicationServices {
 		// Don't prevent AS from creating aliases in its own namespace
 		// Note that Dendrite uses SenderLocalpart as UserID for AS users
@@ -269,10 +269,10 @@ func GetVisibility(
 // SetVisibility implements PUT /directory/list/room/{roomID}
 // TODO: Allow admin users to edit the room visibility
 func SetVisibility(
-	req *http.Request, stateAPI currentstateAPI.CurrentStateInternalAPI, rsAPI roomserverAPI.RoomserverInternalAPI, dev *userapi.Device,
+	req *http.Request, rsAPI roomserverAPI.RoomserverInternalAPI, dev *userapi.Device,
 	roomID string,
 ) util.JSONResponse {
-	resErr := checkMemberInRoom(req.Context(), stateAPI, dev.UserID, roomID)
+	resErr := checkMemberInRoom(req.Context(), rsAPI, dev.UserID, roomID)
 	if resErr != nil {
 		return *resErr
 	}

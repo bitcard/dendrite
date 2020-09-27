@@ -18,6 +18,7 @@ package sqlite3
 import (
 	"context"
 	"database/sql"
+	"strings"
 
 	"github.com/matrix-org/dendrite/federationsender/types"
 	"github.com/matrix-org/dendrite/internal"
@@ -59,19 +60,21 @@ const selectJoinedHostsSQL = "" +
 const selectAllJoinedHostsSQL = "" +
 	"SELECT DISTINCT server_name FROM federationsender_joined_hosts"
 
+const selectJoinedHostsForRoomsSQL = "" +
+	"SELECT DISTINCT server_name FROM federationsender_joined_hosts WHERE room_id IN ($1)"
+
 type joinedHostsStatements struct {
 	db                       *sql.DB
-	writer                   *sqlutil.TransactionWriter
 	insertJoinedHostsStmt    *sql.Stmt
 	deleteJoinedHostsStmt    *sql.Stmt
 	selectJoinedHostsStmt    *sql.Stmt
 	selectAllJoinedHostsStmt *sql.Stmt
+	// selectJoinedHostsForRoomsStmt *sql.Stmt - prepared at runtime due to variadic
 }
 
 func NewSQLiteJoinedHostsTable(db *sql.DB) (s *joinedHostsStatements, err error) {
 	s = &joinedHostsStatements{
-		db:     db,
-		writer: sqlutil.NewTransactionWriter(),
+		db: db,
 	}
 	_, err = db.Exec(joinedHostsSchema)
 	if err != nil {
@@ -98,25 +101,21 @@ func (s *joinedHostsStatements) InsertJoinedHosts(
 	roomID, eventID string,
 	serverName gomatrixserverlib.ServerName,
 ) error {
-	return s.writer.Do(s.db, txn, func(txn *sql.Tx) error {
-		stmt := sqlutil.TxStmt(txn, s.insertJoinedHostsStmt)
-		_, err := stmt.ExecContext(ctx, roomID, eventID, serverName)
-		return err
-	})
+	stmt := sqlutil.TxStmt(txn, s.insertJoinedHostsStmt)
+	_, err := stmt.ExecContext(ctx, roomID, eventID, serverName)
+	return err
 }
 
 func (s *joinedHostsStatements) DeleteJoinedHosts(
 	ctx context.Context, txn *sql.Tx, eventIDs []string,
 ) error {
-	return s.writer.Do(s.db, txn, func(txn *sql.Tx) error {
-		for _, eventID := range eventIDs {
-			stmt := sqlutil.TxStmt(txn, s.deleteJoinedHostsStmt)
-			if _, err := stmt.ExecContext(ctx, eventID); err != nil {
-				return err
-			}
+	for _, eventID := range eventIDs {
+		stmt := sqlutil.TxStmt(txn, s.deleteJoinedHostsStmt)
+		if _, err := stmt.ExecContext(ctx, eventID); err != nil {
+			return err
 		}
-		return nil
-	})
+	}
+	return nil
 }
 
 func (s *joinedHostsStatements) SelectJoinedHostsWithTx(
@@ -140,6 +139,33 @@ func (s *joinedHostsStatements) SelectAllJoinedHosts(
 		return nil, err
 	}
 	defer internal.CloseAndLogIfError(ctx, rows, "selectAllJoinedHosts: rows.close() failed")
+
+	var result []gomatrixserverlib.ServerName
+	for rows.Next() {
+		var serverName string
+		if err = rows.Scan(&serverName); err != nil {
+			return nil, err
+		}
+		result = append(result, gomatrixserverlib.ServerName(serverName))
+	}
+
+	return result, rows.Err()
+}
+
+func (s *joinedHostsStatements) SelectJoinedHostsForRooms(
+	ctx context.Context, roomIDs []string,
+) ([]gomatrixserverlib.ServerName, error) {
+	iRoomIDs := make([]interface{}, len(roomIDs))
+	for i := range roomIDs {
+		iRoomIDs[i] = roomIDs[i]
+	}
+
+	sql := strings.Replace(selectJoinedHostsForRoomsSQL, "($1)", sqlutil.QueryVariadic(len(iRoomIDs)), 1)
+	rows, err := s.db.QueryContext(ctx, sql, iRoomIDs...)
+	if err != nil {
+		return nil, err
+	}
+	defer internal.CloseAndLogIfError(ctx, rows, "selectJoinedHostsForRoomsStmt: rows.close() failed")
 
 	var result []gomatrixserverlib.ServerName
 	for rows.Next() {

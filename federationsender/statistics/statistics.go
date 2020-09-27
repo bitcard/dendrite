@@ -44,6 +44,7 @@ func (s *Statistics) ForServer(serverName gomatrixserverlib.ServerName) *ServerS
 		server = &ServerStatistics{
 			statistics: s,
 			serverName: serverName,
+			interrupt:  make(chan struct{}),
 		}
 		s.servers[serverName] = server
 		s.mutex.Unlock()
@@ -65,9 +66,26 @@ type ServerStatistics struct {
 	statistics     *Statistics                  //
 	serverName     gomatrixserverlib.ServerName //
 	blacklisted    atomic.Bool                  // is the node blacklisted
-	backoffUntil   atomic.Value                 // time.Time to wait until before sending requests
-	failCounter    atomic.Uint32                // how many times have we failed?
+	backoffStarted atomic.Bool                  // is the backoff started
+	backoffUntil   atomic.Value                 // time.Time until this backoff interval ends
+	backoffCount   atomic.Uint32                // number of times BackoffDuration has been called
+	interrupt      chan struct{}                // interrupts the backoff goroutine
 	successCounter atomic.Uint32                // how many times have we succeeded?
+}
+
+// duration returns how long the next backoff interval should be.
+func (s *ServerStatistics) duration(count uint32) time.Duration {
+	return time.Second * time.Duration(math.Exp2(float64(count)))
+}
+
+// cancel will interrupt the currently active backoff.
+func (s *ServerStatistics) cancel() {
+	s.blacklisted.Store(false)
+	s.backoffUntil.Store(time.Time{})
+	select {
+	case s.interrupt <- struct{}{}:
+	default:
+	}
 }
 
 // Success updates the server statistics with a new successful
@@ -75,56 +93,78 @@ type ServerStatistics struct {
 // failure counters. If a host was blacklisted at this point then
 // we will unblacklist it.
 func (s *ServerStatistics) Success() {
-	s.successCounter.Add(1)
-	s.failCounter.Store(0)
-	s.blacklisted.Store(false)
-	if err := s.statistics.DB.RemoveServerFromBlacklist(s.serverName); err != nil {
-		logrus.WithError(err).Errorf("Failed to remove %q from blacklist", s.serverName)
+	s.cancel()
+	s.successCounter.Inc()
+	s.backoffCount.Store(0)
+	if s.statistics.DB != nil {
+		if err := s.statistics.DB.RemoveServerFromBlacklist(s.serverName); err != nil {
+			logrus.WithError(err).Errorf("Failed to remove %q from blacklist", s.serverName)
+		}
 	}
 }
 
-// Failure marks a failure and works out when to backoff until. It
-// returns true if the worker should give up altogether because of
-// too many consecutive failures. At this point the host is marked
-// as blacklisted.
-func (s *ServerStatistics) Failure() bool {
-	// Increase the fail counter.
-	failCounter := s.failCounter.Add(1)
-
-	// Check that we haven't failed more times than is acceptable.
-	if failCounter >= s.statistics.FailuresUntilBlacklist {
-		// We've exceeded the maximum amount of times we're willing
-		// to back off, which is probably in the region of hours by
-		// now. Mark the host as blacklisted and tell the caller to
-		// give up.
-		s.blacklisted.Store(true)
-		if err := s.statistics.DB.AddServerToBlacklist(s.serverName); err != nil {
-			logrus.WithError(err).Errorf("Failed to add %q to blacklist", s.serverName)
+// Failure marks a failure and starts backing off if needed.
+// The next call to BackoffIfRequired will do the right thing
+// after this. It will return the time that the current failure
+// will result in backoff waiting until, and a bool signalling
+// whether we have blacklisted and therefore to give up.
+func (s *ServerStatistics) Failure() (time.Time, bool) {
+	// If we aren't already backing off, this call will start
+	// a new backoff period. Increase the failure counter and
+	// start a goroutine which will wait out the backoff and
+	// unset the backoffStarted flag when done.
+	if s.backoffStarted.CAS(false, true) {
+		if s.backoffCount.Inc() >= s.statistics.FailuresUntilBlacklist {
+			s.blacklisted.Store(true)
+			if s.statistics.DB != nil {
+				if err := s.statistics.DB.AddServerToBlacklist(s.serverName); err != nil {
+					logrus.WithError(err).Errorf("Failed to add %q to blacklist", s.serverName)
+				}
+			}
+			return time.Time{}, true
 		}
-		return true
+
+		go func() {
+			until, ok := s.backoffUntil.Load().(time.Time)
+			if ok {
+				select {
+				case <-time.After(time.Until(until)):
+				case <-s.interrupt:
+				}
+			}
+			s.backoffStarted.Store(false)
+		}()
 	}
 
-	// We're still under the threshold so work out the exponential
-	// backoff based on how many times we have failed already. The
-	// worker goroutine will wait until this time before processing
-	// anything from the queue.
-	backoffSeconds := time.Second * time.Duration(math.Exp2(float64(failCounter)))
-	s.backoffUntil.Store(
-		time.Now().Add(backoffSeconds),
-	)
-	return false
+	// Check if we have blacklisted this node.
+	if s.blacklisted.Load() {
+		return time.Now(), true
+	}
+
+	// If we're already backing off and we haven't yet surpassed
+	// the deadline then return that. Repeated calls to Failure
+	// within a single backoff interval will have no side effects.
+	if until, ok := s.backoffUntil.Load().(time.Time); ok && !time.Now().After(until) {
+		return until, false
+	}
+
+	// We're either backing off and have passed the deadline, or
+	// we aren't backing off, so work out what the next interval
+	// will be.
+	count := s.backoffCount.Load()
+	until := time.Now().Add(s.duration(count))
+	s.backoffUntil.Store(until)
+	return until, false
 }
 
-// BackoffDuration returns both a bool stating whether to wait,
-// and then if true, a duration to wait for.
-func (s *ServerStatistics) BackoffDuration() (bool, time.Duration) {
-	backoff, until := false, time.Second
-	if b, ok := s.backoffUntil.Load().(time.Time); ok {
-		if b.After(time.Now()) {
-			backoff, until = true, time.Until(b)
-		}
+// BackoffInfo returns information about the current or previous backoff.
+// Returns the last backoffUntil time and whether the server is currently blacklisted or not.
+func (s *ServerStatistics) BackoffInfo() (*time.Time, bool) {
+	until, ok := s.backoffUntil.Load().(time.Time)
+	if ok {
+		return &until, s.blacklisted.Load()
 	}
-	return backoff, until
+	return nil, s.blacklisted.Load()
 }
 
 // Blacklisted returns true if the server is blacklisted and false

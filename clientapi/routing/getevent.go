@@ -30,7 +30,7 @@ type getEventRequest struct {
 	device         *userapi.Device
 	roomID         string
 	eventID        string
-	cfg            *config.Dendrite
+	cfg            *config.ClientAPI
 	federation     *gomatrixserverlib.FederationClient
 	requestedEvent gomatrixserverlib.Event
 }
@@ -42,7 +42,7 @@ func GetEvent(
 	device *userapi.Device,
 	roomID string,
 	eventID string,
-	cfg *config.Dendrite,
+	cfg *config.ClientAPI,
 	rsAPI api.RoomserverInternalAPI,
 	federation *gomatrixserverlib.FederationClient,
 ) util.JSONResponse {
@@ -104,17 +104,18 @@ func GetEvent(
 	}
 
 	for _, stateEvent := range stateResp.StateEvents {
-		if stateEvent.StateKeyEquals(r.device.UserID) {
-			membership, err := stateEvent.Membership()
-			if err != nil {
-				util.GetLogger(req.Context()).WithError(err).Error("stateEvent.Membership failed")
-				return jsonerror.InternalServerError()
-			}
-			if membership == gomatrixserverlib.Join {
-				return util.JSONResponse{
-					Code: http.StatusOK,
-					JSON: gomatrixserverlib.ToClientEvent(r.requestedEvent, gomatrixserverlib.FormatAll),
-				}
+		if !stateEvent.StateKeyEquals(device.UserID) {
+			continue
+		}
+		membership, err := stateEvent.Membership()
+		if err != nil {
+			util.GetLogger(req.Context()).WithError(err).Error("stateEvent.Membership failed")
+			return jsonerror.InternalServerError()
+		}
+		if membership == gomatrixserverlib.Join {
+			return util.JSONResponse{
+				Code: http.StatusOK,
+				JSON: gomatrixserverlib.ToClientEvent(r.requestedEvent, gomatrixserverlib.FormatAll),
 			}
 		}
 	}

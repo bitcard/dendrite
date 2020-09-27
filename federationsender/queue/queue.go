@@ -20,13 +20,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/matrix-org/dendrite/federationsender/statistics"
 	"github.com/matrix-org/dendrite/federationsender/storage"
 	"github.com/matrix-org/dendrite/roomserver/api"
 	"github.com/matrix-org/gomatrixserverlib"
-	"github.com/matrix-org/util"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 )
 
 // OutgoingQueues is a collection of queues for sending transactions to other
@@ -61,26 +62,28 @@ func NewOutgoingQueues(
 		queues:     map[gomatrixserverlib.ServerName]*destinationQueue{},
 	}
 	// Look up which servers we have pending items for and then rehydrate those queues.
-	serverNames := map[gomatrixserverlib.ServerName]struct{}{}
-	if names, err := db.GetPendingPDUServerNames(context.Background()); err == nil {
-		for _, serverName := range names {
-			serverNames[serverName] = struct{}{}
+	time.AfterFunc(time.Second*5, func() {
+		serverNames := map[gomatrixserverlib.ServerName]struct{}{}
+		if names, err := db.GetPendingPDUServerNames(context.Background()); err == nil {
+			for _, serverName := range names {
+				serverNames[serverName] = struct{}{}
+			}
+		} else {
+			log.WithError(err).Error("Failed to get PDU server names for destination queue hydration")
 		}
-	} else {
-		log.WithError(err).Error("Failed to get PDU server names for destination queue hydration")
-	}
-	if names, err := db.GetPendingEDUServerNames(context.Background()); err == nil {
-		for _, serverName := range names {
-			serverNames[serverName] = struct{}{}
+		if names, err := db.GetPendingEDUServerNames(context.Background()); err == nil {
+			for _, serverName := range names {
+				serverNames[serverName] = struct{}{}
+			}
+		} else {
+			log.WithError(err).Error("Failed to get EDU server names for destination queue hydration")
 		}
-	} else {
-		log.WithError(err).Error("Failed to get EDU server names for destination queue hydration")
-	}
-	for serverName := range serverNames {
-		if !queues.getQueue(serverName).statistics.Blacklisted() {
-			queues.getQueue(serverName).wakeQueueIfNeeded()
+		for serverName := range serverNames {
+			if !queues.getQueue(serverName).statistics.Blacklisted() {
+				queues.getQueue(serverName).wakeQueueIfNeeded()
+			}
 		}
-	}
+	})
 	return queues
 }
 
@@ -104,7 +107,6 @@ func (oqs *OutgoingQueues) getQueue(destination gomatrixserverlib.ServerName) *d
 			destination:      destination,
 			client:           oqs.client,
 			statistics:       oqs.statistics.ForServer(destination),
-			incomingInvites:  make(chan *gomatrixserverlib.InviteV2Request, 128),
 			notifyPDUs:       make(chan bool, 1),
 			notifyEDUs:       make(chan bool, 1),
 			interruptBackoff: make(chan bool),
@@ -128,15 +130,34 @@ func (oqs *OutgoingQueues) SendEvent(
 		)
 	}
 
-	// Remove our own server from the list of destinations.
-	destinations = filterAndDedupeDests(oqs.origin, destinations)
-	if len(destinations) == 0 {
+	// Deduplicate destinations and remove the origin from the list of
+	// destinations just to be sure.
+	destmap := map[gomatrixserverlib.ServerName]struct{}{}
+	for _, d := range destinations {
+		destmap[d] = struct{}{}
+	}
+	delete(destmap, oqs.origin)
+
+	// Check if any of the destinations are prohibited by server ACLs.
+	for destination := range destmap {
+		if api.IsServerBannedFromRoom(
+			context.TODO(),
+			oqs.rsAPI,
+			ev.RoomID(),
+			destination,
+		) {
+			delete(destmap, destination)
+		}
+	}
+
+	// If there are no remaining destinations then give up.
+	if len(destmap) == 0 {
 		return nil
 	}
 
 	log.WithFields(log.Fields{
-		"destinations": destinations, "event": ev.EventID(),
-	}).Info("Sending event")
+		"destinations": len(destmap), "event": ev.EventID(),
+	}).Infof("Sending event")
 
 	headeredJSON, err := json.Marshal(ev)
 	if err != nil {
@@ -148,41 +169,9 @@ func (oqs *OutgoingQueues) SendEvent(
 		return fmt.Errorf("sendevent: oqs.db.StoreJSON: %w", err)
 	}
 
-	for _, destination := range destinations {
+	for destination := range destmap {
 		oqs.getQueue(destination).sendEvent(nid)
 	}
-
-	return nil
-}
-
-// SendEvent sends an event to the destinations
-func (oqs *OutgoingQueues) SendInvite(
-	inviteReq *gomatrixserverlib.InviteV2Request,
-) error {
-	ev := inviteReq.Event()
-	stateKey := ev.StateKey()
-	if stateKey == nil {
-		log.WithFields(log.Fields{
-			"event_id": ev.EventID(),
-		}).Info("invite had no state key, dropping")
-		return nil
-	}
-
-	_, destination, err := gomatrixserverlib.SplitID('@', *stateKey)
-	if err != nil {
-		log.WithFields(log.Fields{
-			"event_id":  ev.EventID(),
-			"state_key": stateKey,
-		}).Info("failed to split destination from state key")
-		return nil
-	}
-
-	log.WithFields(log.Fields{
-		"event_id":    ev.EventID(),
-		"server_name": destination,
-	}).Info("Sending invite")
-
-	oqs.getQueue(destination).sendInvite(inviteReq)
 
 	return nil
 }
@@ -200,14 +189,40 @@ func (oqs *OutgoingQueues) SendEDU(
 		)
 	}
 
-	// Remove our own server from the list of destinations.
-	destinations = filterAndDedupeDests(oqs.origin, destinations)
-
-	if len(destinations) > 0 {
-		log.WithFields(log.Fields{
-			"destinations": destinations, "edu_type": e.Type,
-		}).Info("Sending EDU event")
+	// Deduplicate destinations and remove the origin from the list of
+	// destinations just to be sure.
+	destmap := map[gomatrixserverlib.ServerName]struct{}{}
+	for _, d := range destinations {
+		destmap[d] = struct{}{}
 	}
+	delete(destmap, oqs.origin)
+
+	// There is absolutely no guarantee that the EDU will have a room_id
+	// field, as it is not required by the spec. However, if it *does*
+	// (e.g. typing notifications) then we should try to make sure we don't
+	// bother sending them to servers that are prohibited by the server
+	// ACLs.
+	if result := gjson.GetBytes(e.Content, "room_id"); result.Exists() {
+		for destination := range destmap {
+			if api.IsServerBannedFromRoom(
+				context.TODO(),
+				oqs.rsAPI,
+				result.Str,
+				destination,
+			) {
+				delete(destmap, destination)
+			}
+		}
+	}
+
+	// If there are no remaining destinations then give up.
+	if len(destmap) == 0 {
+		return nil
+	}
+
+	log.WithFields(log.Fields{
+		"destinations": len(destmap), "edu_type": e.Type,
+	}).Info("Sending EDU event")
 
 	ephemeralJSON, err := json.Marshal(e)
 	if err != nil {
@@ -219,7 +234,7 @@ func (oqs *OutgoingQueues) SendEDU(
 		return fmt.Errorf("sendevent: oqs.db.StoreJSON: %w", err)
 	}
 
-	for _, destination := range destinations {
+	for destination := range destmap {
 		oqs.getQueue(destination).sendEDU(nid)
 	}
 
@@ -233,22 +248,4 @@ func (oqs *OutgoingQueues) RetryServer(srv gomatrixserverlib.ServerName) {
 		return
 	}
 	q.wakeQueueIfNeeded()
-}
-
-// filterAndDedupeDests removes our own server from the list of destinations
-// and deduplicates any servers in the list that may appear more than once.
-func filterAndDedupeDests(origin gomatrixserverlib.ServerName, destinations []gomatrixserverlib.ServerName) (
-	result []gomatrixserverlib.ServerName,
-) {
-	strs := make([]string, len(destinations))
-	for i, d := range destinations {
-		strs[i] = string(d)
-	}
-	for _, destination := range util.UniqueStrings(strs) {
-		if gomatrixserverlib.ServerName(destination) == origin {
-			continue
-		}
-		result = append(result, gomatrixserverlib.ServerName(destination))
-	}
-	return result
 }

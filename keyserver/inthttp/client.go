@@ -21,15 +21,19 @@ import (
 
 	"github.com/matrix-org/dendrite/internal/httputil"
 	"github.com/matrix-org/dendrite/keyserver/api"
+	userapi "github.com/matrix-org/dendrite/userapi/api"
 	"github.com/opentracing/opentracing-go"
 )
 
 // HTTP paths for the internal HTTP APIs
 const (
-	PerformUploadKeysPath = "/keyserver/performUploadKeys"
-	PerformClaimKeysPath  = "/keyserver/performClaimKeys"
-	QueryKeysPath         = "/keyserver/queryKeys"
-	QueryKeyChangesPath   = "/keyserver/queryKeyChanges"
+	InputDeviceListUpdatePath = "/keyserver/inputDeviceListUpdate"
+	PerformUploadKeysPath     = "/keyserver/performUploadKeys"
+	PerformClaimKeysPath      = "/keyserver/performClaimKeys"
+	QueryKeysPath             = "/keyserver/queryKeys"
+	QueryKeyChangesPath       = "/keyserver/queryKeyChanges"
+	QueryOneTimeKeysPath      = "/keyserver/queryOneTimeKeys"
+	QueryDeviceMessagesPath   = "/keyserver/queryDeviceMessages"
 )
 
 // NewKeyServerClient creates a KeyInternalAPI implemented by talking to a HTTP POST API.
@@ -50,6 +54,24 @@ func NewKeyServerClient(
 type httpKeyInternalAPI struct {
 	apiURL     string
 	httpClient *http.Client
+}
+
+func (h *httpKeyInternalAPI) SetUserAPI(i userapi.UserInternalAPI) {
+	// no-op: doesn't need it
+}
+func (h *httpKeyInternalAPI) InputDeviceListUpdate(
+	ctx context.Context, req *api.InputDeviceListUpdateRequest, res *api.InputDeviceListUpdateResponse,
+) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "InputDeviceListUpdate")
+	defer span.Finish()
+
+	apiURL := h.apiURL + InputDeviceListUpdatePath
+	err := httputil.PostJSON(ctx, span, h.httpClient, apiURL, req, res)
+	if err != nil {
+		res.Error = &api.KeyError{
+			Err: err.Error(),
+		}
+	}
 }
 
 func (h *httpKeyInternalAPI) PerformClaimKeys(
@@ -95,6 +117,40 @@ func (h *httpKeyInternalAPI) QueryKeys(
 	defer span.Finish()
 
 	apiURL := h.apiURL + QueryKeysPath
+	err := httputil.PostJSON(ctx, span, h.httpClient, apiURL, request, response)
+	if err != nil {
+		response.Error = &api.KeyError{
+			Err: err.Error(),
+		}
+	}
+}
+
+func (h *httpKeyInternalAPI) QueryOneTimeKeys(
+	ctx context.Context,
+	request *api.QueryOneTimeKeysRequest,
+	response *api.QueryOneTimeKeysResponse,
+) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "QueryOneTimeKeys")
+	defer span.Finish()
+
+	apiURL := h.apiURL + QueryOneTimeKeysPath
+	err := httputil.PostJSON(ctx, span, h.httpClient, apiURL, request, response)
+	if err != nil {
+		response.Error = &api.KeyError{
+			Err: err.Error(),
+		}
+	}
+}
+
+func (h *httpKeyInternalAPI) QueryDeviceMessages(
+	ctx context.Context,
+	request *api.QueryDeviceMessagesRequest,
+	response *api.QueryDeviceMessagesResponse,
+) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "QueryDeviceMessages")
+	defer span.Finish()
+
+	apiURL := h.apiURL + QueryDeviceMessagesPath
 	err := httputil.PostJSON(ctx, span, h.httpClient, apiURL, request, response)
 	if err != nil {
 		response.Error = &api.KeyError{

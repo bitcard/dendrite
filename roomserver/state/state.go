@@ -31,12 +31,14 @@ import (
 )
 
 type StateResolution struct {
-	db storage.Database
+	db       storage.Database
+	roomInfo types.RoomInfo
 }
 
-func NewStateResolution(db storage.Database) StateResolution {
+func NewStateResolution(db storage.Database, roomInfo types.RoomInfo) StateResolution {
 	return StateResolution{
-		db: db,
+		db:       db,
+		roomInfo: roomInfo,
 	}
 }
 
@@ -157,7 +159,7 @@ func (v StateResolution) LoadCombinedStateAfterEvents(
 			}
 			fullState = append(fullState, entries...)
 		}
-		if prevState.IsStateEvent() {
+		if prevState.IsStateEvent() && !prevState.IsRejected {
 			// If the prev event was a state event then add an entry for the event itself
 			// so that we get the state after the event rather than the state before.
 			fullState = append(fullState, prevState.StateEntry)
@@ -339,7 +341,7 @@ func (v StateResolution) loadStateAtSnapshotForNumericTuples(
 // This is typically the state before an event.
 // Returns a sorted list of state entries or an error if there was a problem talking to the database.
 func (v StateResolution) LoadStateAfterEventsForStringTuples(
-	ctx context.Context, roomNID types.RoomNID,
+	ctx context.Context,
 	prevStates []types.StateAtEvent,
 	stateKeyTuples []gomatrixserverlib.StateKeyTuple,
 ) ([]types.StateEntry, error) {
@@ -347,24 +349,18 @@ func (v StateResolution) LoadStateAfterEventsForStringTuples(
 	if err != nil {
 		return nil, err
 	}
-	return v.loadStateAfterEventsForNumericTuples(ctx, roomNID, prevStates, numericTuples)
+	return v.loadStateAfterEventsForNumericTuples(ctx, prevStates, numericTuples)
 }
 
 func (v StateResolution) loadStateAfterEventsForNumericTuples(
-	ctx context.Context, roomNID types.RoomNID,
+	ctx context.Context,
 	prevStates []types.StateAtEvent,
 	stateKeyTuples []types.StateKeyTuple,
 ) ([]types.StateEntry, error) {
-	roomVersion, err := v.db.GetRoomVersionForRoomNID(ctx, roomNID)
-	if err != nil {
-		return nil, err
-	}
-
 	if len(prevStates) == 1 {
 		// Fast path for a single event.
 		prevState := prevStates[0]
-		var result []types.StateEntry
-		result, err = v.loadStateAtSnapshotForNumericTuples(
+		result, err := v.loadStateAtSnapshotForNumericTuples(
 			ctx, prevState.BeforeStateSnapshotNID, stateKeyTuples,
 		)
 		if err != nil {
@@ -403,7 +399,7 @@ func (v StateResolution) loadStateAfterEventsForNumericTuples(
 
 	// TODO: Add metrics for this as it could take a long time for big rooms
 	// with large conflicts.
-	fullState, _, _, err := v.calculateStateAfterManyEvents(ctx, roomVersion, prevStates)
+	fullState, _, _, err := v.calculateStateAfterManyEvents(ctx, v.roomInfo.RoomVersion, prevStates)
 	if err != nil {
 		return nil, err
 	}
@@ -527,7 +523,7 @@ func init() {
 func (v StateResolution) CalculateAndStoreStateBeforeEvent(
 	ctx context.Context,
 	event gomatrixserverlib.Event,
-	roomNID types.RoomNID,
+	isRejected bool,
 ) (types.StateSnapshotNID, error) {
 	// Load the state at the prev events.
 	prevEventRefs := event.PrevEvents()
@@ -542,14 +538,13 @@ func (v StateResolution) CalculateAndStoreStateBeforeEvent(
 	}
 
 	// The state before this event will be the state after the events that came before it.
-	return v.CalculateAndStoreStateAfterEvents(ctx, roomNID, prevStates)
+	return v.CalculateAndStoreStateAfterEvents(ctx, prevStates)
 }
 
 // CalculateAndStoreStateAfterEvents finds the room state after the given events.
 // Stores the resulting state in the database and returns a numeric ID for that snapshot.
 func (v StateResolution) CalculateAndStoreStateAfterEvents(
 	ctx context.Context,
-	roomNID types.RoomNID,
 	prevStates []types.StateAtEvent,
 ) (types.StateSnapshotNID, error) {
 	metrics := calculateStateMetrics{startTime: time.Now(), prevEventLength: len(prevStates)}
@@ -558,12 +553,16 @@ func (v StateResolution) CalculateAndStoreStateAfterEvents(
 		// 2) There weren't any prev_events for this event so the state is
 		// empty.
 		metrics.algorithm = "empty_state"
-		return metrics.stop(v.db.AddState(ctx, roomNID, nil, nil))
+		stateNID, err := v.db.AddState(ctx, v.roomInfo.RoomNID, nil, nil)
+		if err != nil {
+			err = fmt.Errorf("v.db.AddState: %w", err)
+		}
+		return metrics.stop(stateNID, err)
 	}
 
 	if len(prevStates) == 1 {
 		prevState := prevStates[0]
-		if prevState.EventStateKeyNID == 0 {
+		if prevState.EventStateKeyNID == 0 || prevState.IsRejected {
 			// 3) None of the previous events were state events and they all
 			// have the same state, so this event has exactly the same state
 			// as the previous events.
@@ -578,22 +577,30 @@ func (v StateResolution) CalculateAndStoreStateAfterEvents(
 		)
 		if err != nil {
 			metrics.algorithm = "_load_state_blocks"
-			return metrics.stop(0, err)
+			return metrics.stop(0, fmt.Errorf("v.db.StateBlockNIDs: %w", err))
 		}
 		stateBlockNIDs := stateBlockNIDLists[0].StateBlockNIDs
 		if len(stateBlockNIDs) < maxStateBlockNIDs {
 			// 4) The number of state data blocks is small enough that we can just
 			// add the state event as a block of size one to the end of the blocks.
 			metrics.algorithm = "single_delta"
-			return metrics.stop(v.db.AddState(
-				ctx, roomNID, stateBlockNIDs, []types.StateEntry{prevState.StateEntry},
-			))
+			stateNID, err := v.db.AddState(
+				ctx, v.roomInfo.RoomNID, stateBlockNIDs, []types.StateEntry{prevState.StateEntry},
+			)
+			if err != nil {
+				err = fmt.Errorf("v.db.AddState: %w", err)
+			}
+			return metrics.stop(stateNID, err)
 		}
 		// If there are too many deltas then we need to calculate the full state
 		// So fall through to calculateAndStoreStateAfterManyEvents
 	}
 
-	return v.calculateAndStoreStateAfterManyEvents(ctx, roomNID, prevStates, metrics)
+	stateNID, err := v.calculateAndStoreStateAfterManyEvents(ctx, v.roomInfo.RoomNID, prevStates, metrics)
+	if err != nil {
+		return 0, fmt.Errorf("v.calculateAndStoreStateAfterManyEvents: %w", err)
+	}
+	return stateNID, nil
 }
 
 // maxStateBlockNIDs is the maximum number of state data blocks to use to encode a snapshot of room state.
@@ -612,13 +619,8 @@ func (v StateResolution) calculateAndStoreStateAfterManyEvents(
 	prevStates []types.StateAtEvent,
 	metrics calculateStateMetrics,
 ) (types.StateSnapshotNID, error) {
-	roomVersion, err := v.db.GetRoomVersionForRoomNID(ctx, roomNID)
-	if err != nil {
-		return metrics.stop(0, err)
-	}
-
 	state, algorithm, conflictLength, err :=
-		v.calculateStateAfterManyEvents(ctx, roomVersion, prevStates)
+		v.calculateStateAfterManyEvents(ctx, v.roomInfo.RoomVersion, prevStates)
 	metrics.algorithm = algorithm
 	if err != nil {
 		return metrics.stop(0, err)

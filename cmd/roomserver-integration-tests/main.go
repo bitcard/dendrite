@@ -29,6 +29,7 @@ import (
 	"net/http"
 
 	"github.com/matrix-org/dendrite/internal/caching"
+	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/test"
 	"github.com/matrix-org/dendrite/roomserver/api"
 	"github.com/matrix-org/dendrite/roomserver/inthttp"
@@ -214,7 +215,8 @@ func writeToRoomServer(input []string, roomserverURL string) error {
 	if err != nil {
 		return err
 	}
-	return x.InputRoomEvents(context.Background(), &request, &response)
+	x.InputRoomEvents(context.Background(), &request, &response)
+	return response.Err()
 }
 
 // testRoomserver is used to run integration tests against a single roomserver.
@@ -240,7 +242,7 @@ func testRoomserver(input []string, wantOutput []string, checkQueries func(api.R
 		panic(err)
 	}
 
-	outputTopic := string(cfg.Kafka.Topics.OutputRoomEvent)
+	outputTopic := cfg.Global.Kafka.TopicFor(config.TopicOutputRoomEvent)
 
 	err = exe.DeleteTopic(outputTopic)
 	if err != nil {
@@ -277,7 +279,7 @@ func testRoomserver(input []string, wantOutput []string, checkQueries func(api.R
 	cmd.Args = []string{"dendrite-room-server", "--config", filepath.Join(dir, test.ConfigFile)}
 
 	gotOutput, err := runAndReadFromTopic(cmd, cfg.RoomServerURL()+"/metrics", doInput, outputTopic, len(wantOutput), func() {
-		queryAPI, _ := inthttp.NewRoomserverClient("http://"+string(cfg.Listen.RoomServer), &http.Client{Timeout: timeoutHTTP}, cache)
+		queryAPI, _ := inthttp.NewRoomserverClient("http://"+string(cfg.RoomServer.InternalAPI.Connect), &http.Client{Timeout: timeoutHTTP}, cache)
 		checkQueries(queryAPI)
 	})
 	if err != nil {

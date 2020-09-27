@@ -41,14 +41,15 @@ type OutputSendToDeviceEventConsumer struct {
 // NewOutputSendToDeviceEventConsumer creates a new OutputSendToDeviceEventConsumer.
 // Call Start() to begin consuming from the EDU server.
 func NewOutputSendToDeviceEventConsumer(
-	cfg *config.Dendrite,
+	cfg *config.SyncAPI,
 	kafkaConsumer sarama.Consumer,
 	n *sync.Notifier,
 	store storage.Database,
 ) *OutputSendToDeviceEventConsumer {
 
 	consumer := internal.ContinualConsumer{
-		Topic:          string(cfg.Kafka.Topics.OutputSendToDeviceEvent),
+		ComponentName:  "syncapi/eduserver/sendtodevice",
+		Topic:          string(cfg.Matrix.Kafka.TopicFor(config.TopicOutputSendToDeviceEvent)),
 		Consumer:       kafkaConsumer,
 		PartitionStore: store,
 	}
@@ -106,7 +107,7 @@ func (s *OutputSendToDeviceEventConsumer) onMessage(msg *sarama.ConsumerMessage)
 	s.notifier.OnNewSendToDevice(
 		output.UserID,
 		[]string{output.DeviceID},
-		types.NewStreamToken(0, streamPos),
+		types.NewStreamToken(0, streamPos, nil),
 	)
 
 	return nil

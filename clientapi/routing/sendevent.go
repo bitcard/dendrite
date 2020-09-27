@@ -16,6 +16,7 @@ package routing
 
 import (
 	"net/http"
+	"sync"
 
 	"github.com/matrix-org/dendrite/clientapi/httputil"
 	"github.com/matrix-org/dendrite/clientapi/jsonerror"
@@ -35,6 +36,10 @@ type sendEventResponse struct {
 	EventID string `json:"event_id"`
 }
 
+var (
+	userRoomSendMutexes sync.Map // (roomID+userID) -> mutex. mutexes to ensure correct ordering of sendEvents
+)
+
 // SendEvent implements:
 //   /rooms/{roomID}/send/{eventType}
 //   /rooms/{roomID}/send/{eventType}/{txnID}
@@ -43,7 +48,7 @@ func SendEvent(
 	req *http.Request,
 	device *userapi.Device,
 	roomID, eventType string, txnID, stateKey *string,
-	cfg *config.Dendrite,
+	cfg *config.ClientAPI,
 	rsAPI api.RoomserverInternalAPI,
 	txnCache *transactions.Cache,
 ) util.JSONResponse {
@@ -63,6 +68,13 @@ func SendEvent(
 		}
 	}
 
+	// create a mutex for the specific user in the specific room
+	// this avoids a situation where events that are received in quick succession are sent to the roomserver in a jumbled order
+	userID := device.UserID
+	mutex, _ := userRoomSendMutexes.LoadOrStore(roomID+userID, &sync.Mutex{})
+	mutex.(*sync.Mutex).Lock()
+	defer mutex.(*sync.Mutex).Unlock()
+
 	e, resErr := generateSendEvent(req, device, roomID, eventType, stateKey, cfg, rsAPI)
 	if resErr != nil {
 		return *resErr
@@ -78,27 +90,26 @@ func SendEvent(
 
 	// pass the new event to the roomserver and receive the correct event ID
 	// event ID in case of duplicate transaction is discarded
-	eventID, err := api.SendEvents(
+	if err := api.SendEvents(
 		req.Context(), rsAPI,
 		[]gomatrixserverlib.HeaderedEvent{
 			e.Headered(verRes.RoomVersion),
 		},
 		cfg.Matrix.ServerName,
 		txnAndSessionID,
-	)
-	if err != nil {
+	); err != nil {
 		util.GetLogger(req.Context()).WithError(err).Error("SendEvents failed")
 		return jsonerror.InternalServerError()
 	}
 	util.GetLogger(req.Context()).WithFields(logrus.Fields{
-		"event_id":     eventID,
+		"event_id":     e.EventID(),
 		"room_id":      roomID,
 		"room_version": verRes.RoomVersion,
 	}).Info("Sent event to roomserver")
 
 	res := util.JSONResponse{
 		Code: http.StatusOK,
-		JSON: sendEventResponse{eventID},
+		JSON: sendEventResponse{e.EventID()},
 	}
 	// Add response to transactionsCache
 	if txnID != nil {
@@ -112,7 +123,7 @@ func generateSendEvent(
 	req *http.Request,
 	device *userapi.Device,
 	roomID, eventType string, stateKey *string,
-	cfg *config.Dendrite,
+	cfg *config.ClientAPI,
 	rsAPI api.RoomserverInternalAPI,
 ) (*gomatrixserverlib.Event, *util.JSONResponse) {
 	// parse the incoming http request
@@ -146,7 +157,7 @@ func generateSendEvent(
 	}
 
 	var queryRes api.QueryLatestEventsAndStateResponse
-	e, err := eventutil.BuildEvent(req.Context(), &builder, cfg, evTime, rsAPI, &queryRes)
+	e, err := eventutil.QueryAndBuildEvent(req.Context(), &builder, cfg.Matrix, evTime, rsAPI, &queryRes)
 	if err == eventutil.ErrRoomNoExists {
 		return nil, &util.JSONResponse{
 			Code: http.StatusNotFound,

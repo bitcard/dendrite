@@ -16,7 +16,6 @@ package federationapi
 
 import (
 	"github.com/gorilla/mux"
-	currentstateAPI "github.com/matrix-org/dendrite/currentstateserver/api"
 	eduserverAPI "github.com/matrix-org/dendrite/eduserver/api"
 	federationSenderAPI "github.com/matrix-org/dendrite/federationsender/api"
 	"github.com/matrix-org/dendrite/internal/config"
@@ -30,21 +29,19 @@ import (
 
 // AddPublicRoutes sets up and registers HTTP handlers on the base API muxes for the FederationAPI component.
 func AddPublicRoutes(
-	router *mux.Router,
-	cfg *config.Dendrite,
+	fedRouter, keyRouter *mux.Router,
+	cfg *config.FederationAPI,
 	userAPI userapi.UserInternalAPI,
 	federation *gomatrixserverlib.FederationClient,
 	keyRing gomatrixserverlib.JSONVerifier,
 	rsAPI roomserverAPI.RoomserverInternalAPI,
 	federationSenderAPI federationSenderAPI.FederationSenderInternalAPI,
 	eduAPI eduserverAPI.EDUServerInputAPI,
-	stateAPI currentstateAPI.CurrentStateInternalAPI,
 	keyAPI keyserverAPI.KeyInternalAPI,
 ) {
-
 	routing.Setup(
-		router, cfg, rsAPI,
+		fedRouter, keyRouter, cfg, rsAPI,
 		eduAPI, federationSenderAPI, keyRing,
-		federation, userAPI, stateAPI, keyAPI,
+		federation, userAPI, keyAPI,
 	)
 }

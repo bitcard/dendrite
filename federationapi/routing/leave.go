@@ -25,10 +25,11 @@ import (
 )
 
 // MakeLeave implements the /make_leave API
+// nolint:gocyclo
 func MakeLeave(
 	httpReq *http.Request,
 	request *gomatrixserverlib.FederationRequest,
-	cfg *config.Dendrite,
+	cfg *config.FederationAPI,
 	rsAPI api.RoomserverInternalAPI,
 	roomID, userID string,
 ) util.JSONResponse {
@@ -60,7 +61,7 @@ func MakeLeave(
 	}
 
 	var queryRes api.QueryLatestEventsAndStateResponse
-	event, err := eventutil.BuildEvent(httpReq.Context(), &builder, cfg, time.Now(), rsAPI, &queryRes)
+	event, err := eventutil.QueryAndBuildEvent(httpReq.Context(), &builder, cfg.Matrix, time.Now(), rsAPI, &queryRes)
 	if err == eventutil.ErrRoomNoExists {
 		return util.JSONResponse{
 			Code: http.StatusNotFound,
@@ -74,6 +75,24 @@ func MakeLeave(
 	} else if err != nil {
 		util.GetLogger(httpReq.Context()).WithError(err).Error("eventutil.BuildEvent failed")
 		return jsonerror.InternalServerError()
+	}
+
+	// If the user has already left then just return their last leave
+	// event. This means that /send_leave will be a no-op, which helps
+	// to reject invites multiple times - hopefully.
+	for _, state := range queryRes.StateEvents {
+		if !state.StateKeyEquals(userID) {
+			continue
+		}
+		if mem, merr := state.Membership(); merr == nil && mem == gomatrixserverlib.Leave {
+			return util.JSONResponse{
+				Code: http.StatusOK,
+				JSON: map[string]interface{}{
+					"room_version": event.RoomVersion,
+					"event":        state,
+				},
+			}
+		}
 	}
 
 	// Check that the leave is allowed or not
@@ -99,10 +118,11 @@ func MakeLeave(
 }
 
 // SendLeave implements the /send_leave API
+// nolint:gocyclo
 func SendLeave(
 	httpReq *http.Request,
 	request *gomatrixserverlib.FederationRequest,
-	cfg *config.Dendrite,
+	cfg *config.FederationAPI,
 	rsAPI api.RoomserverInternalAPI,
 	keys gomatrixserverlib.JSONVerifier,
 	roomID, eventID string,
@@ -118,7 +138,14 @@ func SendLeave(
 
 	// Decode the event JSON from the request.
 	event, err := gomatrixserverlib.NewEventFromUntrustedJSON(request.Content(), verRes.RoomVersion)
-	if err != nil {
+	switch err.(type) {
+	case gomatrixserverlib.BadJSONError:
+		return util.JSONResponse{
+			Code: http.StatusBadRequest,
+			JSON: jsonerror.BadJSON(err.Error()),
+		}
+	case nil:
+	default:
 		return util.JSONResponse{
 			Code: http.StatusBadRequest,
 			JSON: jsonerror.NotJSON("The request body could not be decoded into valid JSON. " + err.Error()),
@@ -149,6 +176,48 @@ func SendLeave(
 		}
 	}
 
+	// Check if the user has already left. If so, no-op!
+	queryReq := &api.QueryLatestEventsAndStateRequest{
+		RoomID: roomID,
+		StateToFetch: []gomatrixserverlib.StateKeyTuple{
+			{
+				EventType: gomatrixserverlib.MRoomMember,
+				StateKey:  *event.StateKey(),
+			},
+		},
+	}
+	queryRes := &api.QueryLatestEventsAndStateResponse{}
+	err = rsAPI.QueryLatestEventsAndState(httpReq.Context(), queryReq, queryRes)
+	if err != nil {
+		util.GetLogger(httpReq.Context()).WithError(err).Error("rsAPI.QueryLatestEventsAndState failed")
+		return jsonerror.InternalServerError()
+	}
+	// The room doesn't exist or we weren't ever joined to it. Might as well
+	// no-op here.
+	if !queryRes.RoomExists || len(queryRes.StateEvents) == 0 {
+		return util.JSONResponse{
+			Code: http.StatusOK,
+			JSON: struct{}{},
+		}
+	}
+	// Check if we're recycling a previous leave event.
+	if event.EventID() == queryRes.StateEvents[0].EventID() {
+		return util.JSONResponse{
+			Code: http.StatusOK,
+			JSON: struct{}{},
+		}
+	}
+	// We are/were joined/invited/banned or something. Check if
+	// we can no-op here.
+	if len(queryRes.StateEvents) == 1 {
+		if mem, merr := queryRes.StateEvents[0].Membership(); merr == nil && mem == gomatrixserverlib.Leave {
+			return util.JSONResponse{
+				Code: http.StatusOK,
+				JSON: struct{}{},
+			}
+		}
+	}
+
 	// Check that the event is signed by the server sending the request.
 	redacted := event.Redact()
 	verifyRequests := []gomatrixserverlib.VerifyJSONRequest{{
@@ -174,7 +243,8 @@ func SendLeave(
 	if err != nil {
 		util.GetLogger(httpReq.Context()).WithError(err).Error("event.Membership failed")
 		return jsonerror.InternalServerError()
-	} else if mem != gomatrixserverlib.Leave {
+	}
+	if mem != gomatrixserverlib.Leave {
 		return util.JSONResponse{
 			Code: http.StatusBadRequest,
 			JSON: jsonerror.BadJSON("The membership in the event content must be set to leave"),
@@ -184,15 +254,14 @@ func SendLeave(
 	// Send the events to the room server.
 	// We are responsible for notifying other servers that the user has left
 	// the room, so set SendAsServer to cfg.Matrix.ServerName
-	_, err = api.SendEvents(
+	if err = api.SendEvents(
 		httpReq.Context(), rsAPI,
 		[]gomatrixserverlib.HeaderedEvent{
 			event.Headered(verRes.RoomVersion),
 		},
 		cfg.Matrix.ServerName,
 		nil,
-	)
-	if err != nil {
+	); err != nil {
 		util.GetLogger(httpReq.Context()).WithError(err).Error("producer.SendEvents failed")
 		return jsonerror.InternalServerError()
 	}

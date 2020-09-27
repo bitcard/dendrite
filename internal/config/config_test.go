@@ -33,48 +33,194 @@ func TestLoadConfigRelative(t *testing.T) {
 }
 
 const testConfig = `
-version: 0
-matrix:
+version: 1
+global:
   server_name: localhost
   private_key: matrix_key.pem
-  federation_certificates: [tls_cert.pem]
-media:
-  base_path: media_store
-kafka:
-  addresses: ["localhost:9092"]
-  topics:
-    output_room_event: output.room
-    output_client_data: output.client
-    output_typing_event: output.typing
-    output_send_to_device_event: output.std
-    output_key_change_event: output.key_change
-    user_updates: output.user
-database:
-  media_api: "postgresql:///media_api"
-  account: "postgresql:///account"
-  device: "postgresql:///device"
-  server_key: "postgresql:///server_keys"
-  sync_api: "postgresql:///syn_api"
-  room_server: "postgresql:///room_server"
-  appservice: "postgresql:///appservice"
-  current_state: "postgresql:///current_state"
-  e2e_key: "postgresql:///e2e_key"
-listen:
-  room_server: "localhost:7770"
-  client_api: "localhost:7771"
-  federation_api: "localhost:7772"
-  sync_api: "localhost:7773"
-  media_api: "localhost:7774"
-  appservice_api: "localhost:7777"
-  edu_server: "localhost:7778"
-  user_api: "localhost:7779"
-  current_state_server: "localhost:7775"
-  key_server: "localhost:7776"
+  key_id: ed25519:auto
+  key_validity_period: 168h0m0s
+  trusted_third_party_id_servers:
+  - matrix.org
+  - vector.im
+  kafka:
+    addresses:
+    - localhost:2181
+    topic_prefix: Dendrite
+    use_naffka: true
+    naffka_database:
+      connection_string: file:naffka.db
+      max_open_conns: 100
+      max_idle_conns: 2
+      conn_max_lifetime: -1
+  metrics:
+    enabled: false
+    basic_auth:
+      username: metrics
+      password: metrics
+app_service_api:
+  internal_api:
+    listen: http://localhost:7777
+    connect: http://localhost:7777
+  database:
+    connection_string: file:appservice.db
+    max_open_conns: 100
+    max_idle_conns: 2
+    conn_max_lifetime: -1
+  config_files: []
+client_api:
+  internal_api:
+    listen: http://localhost:7771
+    connect: http://localhost:7771
+  external_api:
+    listen: http://[::]:8071
+  registration_disabled: false
+  registration_shared_secret: ""
+  enable_registration_captcha: false
+  recaptcha_public_key: ""
+  recaptcha_private_key: ""
+  recaptcha_bypass_secret: ""
+  recaptcha_siteverify_api: ""
+  turn:
+    turn_user_lifetime: ""
+    turn_uris: []
+    turn_shared_secret: ""
+    turn_username: ""
+    turn_password: ""
+current_state_server:
+  internal_api:
+    listen: http://localhost:7782
+    connect: http://localhost:7782
+  database:
+    connection_string: file:currentstate.db
+    max_open_conns: 100
+    max_idle_conns: 2
+    conn_max_lifetime: -1
+edu_server:
+  internal_api:
+    listen: http://localhost:7778
+    connect: http://localhost:7778
+federation_api:
+  internal_api:
+    listen: http://localhost:7772
+    connect: http://localhost:7772
+  external_api:
+    listen: http://[::]:8072
+  federation_certificates: []
+federation_sender:
+  internal_api:
+    listen: http://localhost:7775
+    connect: http://localhost:7775
+  database:
+    connection_string: file:federationsender.db
+    max_open_conns: 100
+    max_idle_conns: 2
+    conn_max_lifetime: -1
+  send_max_retries: 16
+  disable_tls_validation: false
+  proxy_outbound:
+    enabled: false
+    protocol: http
+    host: localhost
+    port: 8080
+key_server:
+  internal_api:
+    listen: http://localhost:7779
+    connect: http://localhost:7779
+  database:
+    connection_string: file:keyserver.db
+    max_open_conns: 100
+    max_idle_conns: 2
+    conn_max_lifetime: -1
+media_api:
+  internal_api:
+    listen: http://localhost:7774
+    connect: http://localhost:7774
+  external_api:
+    listen: http://[::]:8074
+  database:
+    connection_string: file:mediaapi.db
+    max_open_conns: 100
+    max_idle_conns: 2
+    conn_max_lifetime: -1
+  base_path: ./media_store
+  max_file_size_bytes: 10485760
+  dynamic_thumbnails: false
+  max_thumbnail_generators: 10
+  thumbnail_sizes:
+  - width: 32
+    height: 32
+    method: crop
+  - width: 96
+    height: 96
+    method: crop
+  - width: 640
+    height: 480
+    method: scale
+room_server:
+  internal_api:
+    listen: http://localhost:7770
+    connect: http://localhost:7770
+  database:
+    connection_string: file:roomserver.db
+    max_open_conns: 100
+    max_idle_conns: 2
+    conn_max_lifetime: -1
+server_key_api:
+  internal_api:
+    listen: http://localhost:7780
+    connect: http://localhost:7780
+  database:
+    connection_string: file:serverkeyapi.db
+    max_open_conns: 100
+    max_idle_conns: 2
+    conn_max_lifetime: -1
+  key_perspectives:
+  - server_name: matrix.org
+    keys:
+    - key_id: ed25519:auto
+      public_key: Noi6WqcDj0QmPxCNQqgezwTlBKrfqehY1u2FyWP9uYw
+    - key_id: ed25519:a_RXGa
+      public_key: l8Hft5qXKn1vfHrg3p4+W8gELQVo8N13JkluMfmn2sQ
+sync_api:
+  internal_api:
+    listen: http://localhost:7773
+    connect: http://localhost:7773
+  database:
+    connection_string: file:syncapi.db
+    max_open_conns: 100
+    max_idle_conns: 2
+    conn_max_lifetime: -1
+user_api:
+  internal_api:
+    listen: http://localhost:7781
+    connect: http://localhost:7781
+  account_database:
+    connection_string: file:userapi_accounts.db
+    max_open_conns: 100
+    max_idle_conns: 2
+    conn_max_lifetime: -1
+  device_database:
+    connection_string: file:userapi_devices.db
+    max_open_conns: 100
+    max_idle_conns: 2
+    conn_max_lifetime: -1
+tracing:
+  enabled: false
+  jaeger:
+    serviceName: ""
+    disabled: false
+    rpc_metrics: false
+    tags: []
+    sampler: null
+    reporter: null
+    headers: null
+    baggage_restrictions: null
+    throttler: null
 logging:
-  - type: "file"
-    level: "info"
-    params:
-      path: "/my/log/dir"
+- type: file
+  level: info
+  params:
+    path: /var/log/dendrite
 `
 
 type mockReadFile map[string]string
@@ -88,7 +234,7 @@ func (m mockReadFile) readFile(path string) ([]byte, error) {
 }
 
 func TestReadKey(t *testing.T) {
-	keyID, _, err := readKeyPEM("path/to/key", []byte(testKey))
+	keyID, _, err := readKeyPEM("path/to/key", []byte(testKey), true)
 	if err != nil {
 		t.Error("failed to load private key:", err)
 	}

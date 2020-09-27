@@ -31,8 +31,18 @@ type KeyChange struct {
 	DB       storage.Database
 }
 
+// DefaultPartition returns the default partition this process is sending key changes to.
+// NB: A keyserver MUST send key changes to only 1 partition or else query operations will
+// become inconsistent. Partitions can be sharded (e.g by hash of user ID of key change) but
+// then all keyservers must be queried to calculate the entire set of key changes between
+// two sync tokens.
+func (p *KeyChange) DefaultPartition() int32 {
+	return 0
+}
+
 // ProduceKeyChanges creates new change events for each key
-func (p *KeyChange) ProduceKeyChanges(keys []api.DeviceKeys) error {
+func (p *KeyChange) ProduceKeyChanges(keys []api.DeviceMessage) error {
+	userToDeviceCount := make(map[string]int)
 	for _, key := range keys {
 		var m sarama.ProducerMessage
 
@@ -53,11 +63,12 @@ func (p *KeyChange) ProduceKeyChanges(keys []api.DeviceKeys) error {
 		if err != nil {
 			return err
 		}
+		userToDeviceCount[key.UserID]++
+	}
+	for userID, count := range userToDeviceCount {
 		logrus.WithFields(logrus.Fields{
-			"user_id":   key.UserID,
-			"device_id": key.DeviceID,
-			"partition": partition,
-			"offset":    offset,
+			"user_id":         userID,
+			"num_key_changes": count,
 		}).Infof("Produced to key change topic '%s'", p.Topic)
 	}
 	return nil

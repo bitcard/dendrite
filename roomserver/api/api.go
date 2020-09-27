@@ -16,13 +16,13 @@ type RoomserverInternalAPI interface {
 		ctx context.Context,
 		request *InputRoomEventsRequest,
 		response *InputRoomEventsResponse,
-	) error
+	)
 
 	PerformInvite(
 		ctx context.Context,
 		req *PerformInviteRequest,
 		res *PerformInviteResponse,
-	)
+	) error
 
 	PerformJoin(
 		ctx context.Context,
@@ -35,6 +35,12 @@ type RoomserverInternalAPI interface {
 		req *PerformLeaveRequest,
 		res *PerformLeaveResponse,
 	) error
+
+	PerformPeek(
+		ctx context.Context,
+		req *PerformPeekRequest,
+		res *PerformPeekResponse,
+	)
 
 	PerformPublish(
 		ctx context.Context,
@@ -83,6 +89,13 @@ type RoomserverInternalAPI interface {
 		response *QueryMembershipsForRoomResponse,
 	) error
 
+	// Query if we think we're still in a room.
+	QueryServerJoinedToRoom(
+		ctx context.Context,
+		request *QueryServerJoinedToRoomRequest,
+		response *QueryServerJoinedToRoomResponse,
+	) error
+
 	// Query whether a server is allowed to see an event
 	QueryServerAllowedToSeeEvent(
 		ctx context.Context,
@@ -105,6 +118,20 @@ type RoomserverInternalAPI interface {
 		request *QueryStateAndAuthChainRequest,
 		response *QueryStateAndAuthChainResponse,
 	) error
+
+	// QueryCurrentState retrieves the requested state events. If state events are not found, they will be missing from
+	// the response.
+	QueryCurrentState(ctx context.Context, req *QueryCurrentStateRequest, res *QueryCurrentStateResponse) error
+	// QueryRoomsForUser retrieves a list of room IDs matching the given query.
+	QueryRoomsForUser(ctx context.Context, req *QueryRoomsForUserRequest, res *QueryRoomsForUserResponse) error
+	// QueryBulkStateContent does a bulk query for state event content in the given rooms.
+	QueryBulkStateContent(ctx context.Context, req *QueryBulkStateContentRequest, res *QueryBulkStateContentResponse) error
+	// QuerySharedUsers returns a list of users who share at least 1 room in common with the given user.
+	QuerySharedUsers(ctx context.Context, req *QuerySharedUsersRequest, res *QuerySharedUsersResponse) error
+	// QueryKnownUsers returns a list of users that we know about from our joined rooms.
+	QueryKnownUsers(ctx context.Context, req *QueryKnownUsersRequest, res *QueryKnownUsersResponse) error
+	// QueryServerBannedFromRoom returns whether a server is banned from a room by server ACLs.
+	QueryServerBannedFromRoom(ctx context.Context, req *QueryServerBannedFromRoomRequest, res *QueryServerBannedFromRoomResponse) error
 
 	// Query a given amount (or less) of events prior to a given set of events.
 	PerformBackfill(

@@ -19,6 +19,7 @@ import (
 	"database/sql"
 
 	"github.com/matrix-org/dendrite/federationsender/storage/shared"
+	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/sqlutil"
 )
 
@@ -26,16 +27,18 @@ import (
 type Database struct {
 	shared.Database
 	sqlutil.PartitionOffsetStatements
-	db *sql.DB
+	db     *sql.DB
+	writer sqlutil.Writer
 }
 
 // NewDatabase opens a new database
-func NewDatabase(dataSourceName string, dbProperties sqlutil.DbProperties) (*Database, error) {
+func NewDatabase(dbProperties *config.DatabaseOptions) (*Database, error) {
 	var d Database
 	var err error
-	if d.db, err = sqlutil.Open("postgres", dataSourceName, dbProperties); err != nil {
+	if d.db, err = sqlutil.Open(dbProperties); err != nil {
 		return nil, err
 	}
+	d.writer = sqlutil.NewDummyWriter()
 	joinedHosts, err := NewPostgresJoinedHostsTable(d.db)
 	if err != nil {
 		return nil, err
@@ -62,6 +65,7 @@ func NewDatabase(dataSourceName string, dbProperties sqlutil.DbProperties) (*Dat
 	}
 	d.Database = shared.Database{
 		DB:                          d.db,
+		Writer:                      d.writer,
 		FederationSenderJoinedHosts: joinedHosts,
 		FederationSenderQueuePDUs:   queuePDUs,
 		FederationSenderQueueEDUs:   queueEDUs,
@@ -69,7 +73,7 @@ func NewDatabase(dataSourceName string, dbProperties sqlutil.DbProperties) (*Dat
 		FederationSenderRooms:       rooms,
 		FederationSenderBlacklist:   blacklist,
 	}
-	if err = d.PartitionOffsetStatements.Prepare(d.db, "federationsender"); err != nil {
+	if err = d.PartitionOffsetStatements.Prepare(d.db, d.writer, "federationsender"); err != nil {
 		return nil, err
 	}
 	return &d, nil

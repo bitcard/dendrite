@@ -1,3 +1,5 @@
+// Copyright 2020 The Matrix.org Foundation C.I.C.
+//
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -41,27 +43,29 @@ type OutputEDUConsumer struct {
 
 // NewOutputEDUConsumer creates a new OutputEDUConsumer. Call Start() to begin consuming from EDU servers.
 func NewOutputEDUConsumer(
-	cfg *config.Dendrite,
+	cfg *config.FederationSender,
 	kafkaConsumer sarama.Consumer,
 	queues *queue.OutgoingQueues,
 	store storage.Database,
 ) *OutputEDUConsumer {
 	c := &OutputEDUConsumer{
 		typingConsumer: &internal.ContinualConsumer{
-			Topic:          string(cfg.Kafka.Topics.OutputTypingEvent),
+			ComponentName:  "eduserver/typing",
+			Topic:          string(cfg.Matrix.Kafka.TopicFor(config.TopicOutputTypingEvent)),
 			Consumer:       kafkaConsumer,
 			PartitionStore: store,
 		},
 		sendToDeviceConsumer: &internal.ContinualConsumer{
-			Topic:          string(cfg.Kafka.Topics.OutputSendToDeviceEvent),
+			ComponentName:  "eduserver/sendtodevice",
+			Topic:          string(cfg.Matrix.Kafka.TopicFor(config.TopicOutputSendToDeviceEvent)),
 			Consumer:       kafkaConsumer,
 			PartitionStore: store,
 		},
 		queues:            queues,
 		db:                store,
 		ServerName:        cfg.Matrix.ServerName,
-		TypingTopic:       string(cfg.Kafka.Topics.OutputTypingEvent),
-		SendToDeviceTopic: string(cfg.Kafka.Topics.OutputSendToDeviceEvent),
+		TypingTopic:       string(cfg.Matrix.Kafka.TopicFor(config.TopicOutputTypingEvent)),
+		SendToDeviceTopic: string(cfg.Matrix.Kafka.TopicFor(config.TopicOutputSendToDeviceEvent)),
 	}
 	c.typingConsumer.ProcessMessage = c.onTypingEvent
 	c.sendToDeviceConsumer.ProcessMessage = c.onSendToDeviceEvent

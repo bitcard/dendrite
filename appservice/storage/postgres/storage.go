@@ -21,6 +21,7 @@ import (
 
 	// Import postgres database driver
 	_ "github.com/lib/pq"
+	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/sqlutil"
 	"github.com/matrix-org/gomatrixserverlib"
 )
@@ -31,19 +32,21 @@ type Database struct {
 	events eventsStatements
 	txnID  txnStatements
 	db     *sql.DB
+	writer sqlutil.Writer
 }
 
 // NewDatabase opens a new database
-func NewDatabase(dataSourceName string, dbProperties sqlutil.DbProperties) (*Database, error) {
+func NewDatabase(dbProperties *config.DatabaseOptions) (*Database, error) {
 	var result Database
 	var err error
-	if result.db, err = sqlutil.Open("postgres", dataSourceName, dbProperties); err != nil {
+	if result.db, err = sqlutil.Open(dbProperties); err != nil {
 		return nil, err
 	}
+	result.writer = sqlutil.NewDummyWriter()
 	if err = result.prepare(); err != nil {
 		return nil, err
 	}
-	if err = result.PartitionOffsetStatements.Prepare(result.db, "appservice"); err != nil {
+	if err = result.PartitionOffsetStatements.Prepare(result.db, result.writer, "appservice"); err != nil {
 		return nil, err
 	}
 	return &result, nil

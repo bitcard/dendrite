@@ -20,6 +20,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 
+	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/sqlutil"
 	"github.com/matrix-org/dendrite/userapi/api"
 	"github.com/matrix-org/gomatrixserverlib"
@@ -35,10 +36,9 @@ type Database struct {
 }
 
 // NewDatabase creates a new device database
-func NewDatabase(dataSourceName string, dbProperties sqlutil.DbProperties, serverName gomatrixserverlib.ServerName) (*Database, error) {
-	var db *sql.DB
-	var err error
-	if db, err = sqlutil.Open("postgres", dataSourceName, dbProperties); err != nil {
+func NewDatabase(dbProperties *config.DatabaseOptions, serverName gomatrixserverlib.ServerName) (*Database, error) {
+	db, err := sqlutil.Open(dbProperties)
+	if err != nil {
 		return nil, err
 	}
 	d := devicesStatements{}
@@ -68,7 +68,7 @@ func (d *Database) GetDeviceByID(
 func (d *Database) GetDevicesByLocalpart(
 	ctx context.Context, localpart string,
 ) ([]api.Device, error) {
-	return d.devices.selectDevicesByLocalpart(ctx, localpart)
+	return d.devices.selectDevicesByLocalpart(ctx, nil, localpart, "")
 }
 
 func (d *Database) GetDevicesByID(ctx context.Context, deviceIDs []string) ([]api.Device, error) {
@@ -175,12 +175,17 @@ func (d *Database) RemoveDevices(
 // database matching the given user ID localpart.
 // If something went wrong during the deletion, it will return the SQL error.
 func (d *Database) RemoveAllDevices(
-	ctx context.Context, localpart string,
-) error {
-	return sqlutil.WithTransaction(d.db, func(txn *sql.Tx) error {
-		if err := d.devices.deleteDevicesByLocalpart(ctx, txn, localpart); err != sql.ErrNoRows {
+	ctx context.Context, localpart, exceptDeviceID string,
+) (devices []api.Device, err error) {
+	err = sqlutil.WithTransaction(d.db, func(txn *sql.Tx) error {
+		devices, err = d.devices.selectDevicesByLocalpart(ctx, txn, localpart, exceptDeviceID)
+		if err != nil {
+			return err
+		}
+		if err := d.devices.deleteDevicesByLocalpart(ctx, txn, localpart, exceptDeviceID); err != sql.ErrNoRows {
 			return err
 		}
 		return nil
 	})
+	return
 }

@@ -20,6 +20,7 @@ import (
 	"database/sql"
 
 	// Import SQLite database driver
+	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/sqlutil"
 	"github.com/matrix-org/gomatrixserverlib"
 	_ "github.com/mattn/go-sqlite3"
@@ -31,34 +32,32 @@ type Database struct {
 	events eventsStatements
 	txnID  txnStatements
 	db     *sql.DB
+	writer sqlutil.Writer
 }
 
 // NewDatabase opens a new database
-func NewDatabase(dataSourceName string) (*Database, error) {
+func NewDatabase(dbProperties *config.DatabaseOptions) (*Database, error) {
 	var result Database
 	var err error
-	cs, err := sqlutil.ParseFileURI(dataSourceName)
-	if err != nil {
+	if result.db, err = sqlutil.Open(dbProperties); err != nil {
 		return nil, err
 	}
-	if result.db, err = sqlutil.Open(sqlutil.SQLiteDriverName(), cs, nil); err != nil {
-		return nil, err
-	}
+	result.writer = sqlutil.NewExclusiveWriter()
 	if err = result.prepare(); err != nil {
 		return nil, err
 	}
-	if err = result.PartitionOffsetStatements.Prepare(result.db, "appservice"); err != nil {
+	if err = result.PartitionOffsetStatements.Prepare(result.db, result.writer, "appservice"); err != nil {
 		return nil, err
 	}
 	return &result, nil
 }
 
 func (d *Database) prepare() error {
-	if err := d.events.prepare(d.db); err != nil {
+	if err := d.events.prepare(d.db, d.writer); err != nil {
 		return err
 	}
 
-	return d.txnID.prepare(d.db)
+	return d.txnID.prepare(d.db, d.writer)
 }
 
 // StoreEvent takes in a gomatrixserverlib.HeaderedEvent and stores it in the database

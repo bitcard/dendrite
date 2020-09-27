@@ -22,12 +22,14 @@ import (
 	"sync"
 	"time"
 
+	fedsenderapi "github.com/matrix-org/dendrite/federationsender/api"
 	"github.com/matrix-org/dendrite/keyserver/api"
 	"github.com/matrix-org/dendrite/keyserver/producers"
 	"github.com/matrix-org/dendrite/keyserver/storage"
 	userapi "github.com/matrix-org/dendrite/userapi/api"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/util"
+	"github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -35,25 +37,45 @@ import (
 type KeyInternalAPI struct {
 	DB         storage.Database
 	ThisServer gomatrixserverlib.ServerName
-	FedClient  *gomatrixserverlib.FederationClient
+	FedClient  fedsenderapi.FederationClient
 	UserAPI    userapi.UserInternalAPI
 	Producer   *producers.KeyChange
+	Updater    *DeviceListUpdater
+}
+
+func (a *KeyInternalAPI) SetUserAPI(i userapi.UserInternalAPI) {
+	a.UserAPI = i
+}
+
+func (a *KeyInternalAPI) InputDeviceListUpdate(
+	ctx context.Context, req *api.InputDeviceListUpdateRequest, res *api.InputDeviceListUpdateResponse,
+) {
+	err := a.Updater.Update(ctx, req.Event)
+	if err != nil {
+		res.Error = &api.KeyError{
+			Err: fmt.Sprintf("failed to update device list: %s", err),
+		}
+	}
 }
 
 func (a *KeyInternalAPI) QueryKeyChanges(ctx context.Context, req *api.QueryKeyChangesRequest, res *api.QueryKeyChangesResponse) {
-	userIDs, latest, err := a.DB.KeyChanges(ctx, req.Partition, req.Offset)
+	if req.Partition < 0 {
+		req.Partition = a.Producer.DefaultPartition()
+	}
+	userIDs, latest, err := a.DB.KeyChanges(ctx, req.Partition, req.Offset, req.ToOffset)
 	if err != nil {
 		res.Error = &api.KeyError{
 			Err: err.Error(),
 		}
 	}
 	res.Offset = latest
+	res.Partition = req.Partition
 	res.UserIDs = userIDs
 }
 
 func (a *KeyInternalAPI) PerformUploadKeys(ctx context.Context, req *api.PerformUploadKeysRequest, res *api.PerformUploadKeysResponse) {
 	res.KeyErrors = make(map[string]map[string]*api.KeyError)
-	a.uploadDeviceKeys(ctx, req, res)
+	a.uploadLocalDeviceKeys(ctx, req, res)
 	a.uploadOneTimeKeys(ctx, req, res)
 }
 
@@ -160,6 +182,43 @@ func (a *KeyInternalAPI) claimRemoteKeys(
 	util.GetLogger(ctx).WithField("num_keys", keysClaimed).Info("Claimed remote keys")
 }
 
+func (a *KeyInternalAPI) QueryOneTimeKeys(ctx context.Context, req *api.QueryOneTimeKeysRequest, res *api.QueryOneTimeKeysResponse) {
+	count, err := a.DB.OneTimeKeysCount(ctx, req.UserID, req.DeviceID)
+	if err != nil {
+		res.Error = &api.KeyError{
+			Err: fmt.Sprintf("Failed to query OTK counts: %s", err),
+		}
+		return
+	}
+	res.Count = *count
+}
+
+func (a *KeyInternalAPI) QueryDeviceMessages(ctx context.Context, req *api.QueryDeviceMessagesRequest, res *api.QueryDeviceMessagesResponse) {
+	msgs, err := a.DB.DeviceKeysForUser(ctx, req.UserID, nil)
+	if err != nil {
+		res.Error = &api.KeyError{
+			Err: fmt.Sprintf("failed to query DB for device keys: %s", err),
+		}
+		return
+	}
+	maxStreamID := 0
+	for _, m := range msgs {
+		if m.StreamID > maxStreamID {
+			maxStreamID = m.StreamID
+		}
+	}
+	// remove deleted devices
+	var result []api.DeviceMessage
+	for _, m := range msgs {
+		if m.KeyJSON == nil {
+			continue
+		}
+		result = append(result, m)
+	}
+	res.Devices = result
+	res.StreamID = maxStreamID
+}
+
 func (a *KeyInternalAPI) QueryKeys(ctx context.Context, req *api.QueryKeysRequest, res *api.QueryKeysResponse) {
 	res.DeviceKeys = make(map[string]map[string]json.RawMessage)
 	res.Failures = make(map[string]interface{})
@@ -198,10 +257,17 @@ func (a *KeyInternalAPI) QueryKeys(ctx context.Context, req *api.QueryKeysReques
 				res.DeviceKeys[userID] = make(map[string]json.RawMessage)
 			}
 			for _, dk := range deviceKeys {
-				// inject display name if known
+				if len(dk.KeyJSON) == 0 {
+					continue // don't include blank keys
+				}
+				// inject display name if known (either locally or remotely)
+				displayName := dk.DisplayName
+				if queryRes.DeviceInfo[dk.DeviceID].DisplayName != "" {
+					displayName = queryRes.DeviceInfo[dk.DeviceID].DisplayName
+				}
 				dk.KeyJSON, _ = sjson.SetBytes(dk.KeyJSON, "unsigned", struct {
 					DisplayName string `json:"device_display_name,omitempty"`
-				}{queryRes.DeviceInfo[dk.DeviceID].DisplayName})
+				}{displayName})
 				res.DeviceKeys[userID][dk.DeviceID] = dk.KeyJSON
 			}
 		} else {
@@ -209,10 +275,41 @@ func (a *KeyInternalAPI) QueryKeys(ctx context.Context, req *api.QueryKeysReques
 			domainToDeviceKeys[domain][userID] = append(domainToDeviceKeys[domain][userID], deviceIDs...)
 		}
 	}
-	// TODO: set device display names when they are known
+
+	// attempt to satisfy key queries from the local database first as we should get device updates pushed to us
+	domainToDeviceKeys = a.remoteKeysFromDatabase(ctx, res, domainToDeviceKeys)
+	if len(domainToDeviceKeys) == 0 {
+		return // nothing to query
+	}
 
 	// perform key queries for remote devices
 	a.queryRemoteKeys(ctx, req.Timeout, res, domainToDeviceKeys)
+}
+
+func (a *KeyInternalAPI) remoteKeysFromDatabase(
+	ctx context.Context, res *api.QueryKeysResponse, domainToDeviceKeys map[string]map[string][]string,
+) map[string]map[string][]string {
+	fetchRemote := make(map[string]map[string][]string)
+	for domain, userToDeviceMap := range domainToDeviceKeys {
+		for userID, deviceIDs := range userToDeviceMap {
+			// we can't safely return keys from the db when all devices are requested as we don't
+			// know if one has just been added.
+			if len(deviceIDs) > 0 {
+				err := a.populateResponseWithDeviceKeysFromDatabase(ctx, res, userID, deviceIDs)
+				if err == nil {
+					continue
+				}
+				util.GetLogger(ctx).WithError(err).Error("populateResponseWithDeviceKeysFromDatabase")
+			}
+			// fetch device lists from remote
+			if _, ok := fetchRemote[domain]; !ok {
+				fetchRemote[domain] = make(map[string][]string)
+			}
+			fetchRemote[domain][userID] = append(fetchRemote[domain][userID], deviceIDs...)
+
+		}
+	}
+	return fetchRemote
 }
 
 func (a *KeyInternalAPI) queryRemoteKeys(
@@ -222,26 +319,12 @@ func (a *KeyInternalAPI) queryRemoteKeys(
 	// allows us to wait until all federation servers have been poked
 	var wg sync.WaitGroup
 	wg.Add(len(domainToDeviceKeys))
-	// mutex for failures
-	var failMu sync.Mutex
+	// mutex for writing directly to res (e.g failures)
+	var respMu sync.Mutex
 
 	// fan out
 	for domain, deviceKeys := range domainToDeviceKeys {
-		go func(serverName string, devKeys map[string][]string) {
-			defer wg.Done()
-			fedCtx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-			queryKeysResp, err := a.FedClient.QueryKeys(fedCtx, gomatrixserverlib.ServerName(serverName), devKeys)
-			if err != nil {
-				failMu.Lock()
-				res.Failures[serverName] = map[string]interface{}{
-					"message": err.Error(),
-				}
-				failMu.Unlock()
-				return
-			}
-			resultCh <- &queryKeysResp
-		}(domain, deviceKeys)
+		go a.queryRemoteKeysOnServer(ctx, domain, deviceKeys, &wg, &respMu, timeout, resultCh, res)
 	}
 
 	// Close the result channel when the goroutines have quit so the for .. range exits
@@ -264,14 +347,126 @@ func (a *KeyInternalAPI) queryRemoteKeys(
 	}
 }
 
-func (a *KeyInternalAPI) uploadDeviceKeys(ctx context.Context, req *api.PerformUploadKeysRequest, res *api.PerformUploadKeysResponse) {
-	var keysToStore []api.DeviceKeys
+func (a *KeyInternalAPI) queryRemoteKeysOnServer(
+	ctx context.Context, serverName string, devKeys map[string][]string, wg *sync.WaitGroup,
+	respMu *sync.Mutex, timeout time.Duration, resultCh chan<- *gomatrixserverlib.RespQueryKeys,
+	res *api.QueryKeysResponse,
+) {
+	defer wg.Done()
+	fedCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	// for users who we do not have any knowledge about, try to start doing device list updates for them
+	// by hitting /users/devices - otherwise fallback to /keys/query which has nicer bulk properties but
+	// lack a stream ID.
+	var userIDsForAllDevices []string
+	for userID, deviceIDs := range devKeys {
+		if len(deviceIDs) == 0 {
+			userIDsForAllDevices = append(userIDsForAllDevices, userID)
+			delete(devKeys, userID)
+		}
+	}
+	for _, userID := range userIDsForAllDevices {
+		err := a.Updater.ManualUpdate(context.Background(), gomatrixserverlib.ServerName(serverName), userID)
+		if err != nil {
+			logrus.WithFields(logrus.Fields{
+				logrus.ErrorKey: err,
+				"user_id":       userID,
+				"server":        serverName,
+			}).Error("Failed to manually update device lists for user")
+			// try to do it via /keys/query
+			devKeys[userID] = []string{}
+			continue
+		}
+		// refresh entries from DB: unlike remoteKeysFromDatabase we know we previously had no device info for this
+		// user so the fact that we're populating all devices here isn't a problem so long as we have devices.
+		respMu.Lock()
+		err = a.populateResponseWithDeviceKeysFromDatabase(ctx, res, userID, nil)
+		respMu.Unlock()
+		if err != nil {
+			logrus.WithFields(logrus.Fields{
+				logrus.ErrorKey: err,
+				"user_id":       userID,
+				"server":        serverName,
+			}).Error("Failed to manually update device lists for user")
+			// try to do it via /keys/query
+			devKeys[userID] = []string{}
+			continue
+		}
+	}
+	if len(devKeys) == 0 {
+		return
+	}
+	queryKeysResp, err := a.FedClient.QueryKeys(fedCtx, gomatrixserverlib.ServerName(serverName), devKeys)
+	if err == nil {
+		resultCh <- &queryKeysResp
+		return
+	}
+	respMu.Lock()
+	res.Failures[serverName] = map[string]interface{}{
+		"message": err.Error(),
+	}
+
+	// last ditch, use the cache only. This is good for when clients hit /keys/query and the remote server
+	// is down, better to return something than nothing at all. Clients can know about the failure by
+	// inspecting the failures map though so they can know it's a cached response.
+	for userID, dkeys := range devKeys {
+		// drop the error as it's already a failure at this point
+		_ = a.populateResponseWithDeviceKeysFromDatabase(ctx, res, userID, dkeys)
+	}
+	respMu.Unlock()
+
+}
+
+func (a *KeyInternalAPI) populateResponseWithDeviceKeysFromDatabase(
+	ctx context.Context, res *api.QueryKeysResponse, userID string, deviceIDs []string,
+) error {
+	keys, err := a.DB.DeviceKeysForUser(ctx, userID, deviceIDs)
+	// if we can't query the db or there are fewer keys than requested, fetch from remote.
+	if err != nil {
+		return fmt.Errorf("DeviceKeysForUser %s %v failed: %w", userID, deviceIDs, err)
+	}
+	if len(keys) < len(deviceIDs) {
+		return fmt.Errorf("DeviceKeysForUser %s returned fewer devices than requested, falling back to remote", userID)
+	}
+	if len(deviceIDs) == 0 && len(keys) == 0 {
+		return fmt.Errorf("DeviceKeysForUser %s returned no keys but wanted all keys, falling back to remote", userID)
+	}
+	if res.DeviceKeys[userID] == nil {
+		res.DeviceKeys[userID] = make(map[string]json.RawMessage)
+	}
+
+	for _, key := range keys {
+		if len(key.KeyJSON) == 0 {
+			continue // ignore deleted keys
+		}
+		// inject the display name
+		key.KeyJSON, _ = sjson.SetBytes(key.KeyJSON, "unsigned", struct {
+			DisplayName string `json:"device_display_name,omitempty"`
+		}{key.DisplayName})
+		res.DeviceKeys[userID][key.DeviceID] = key.KeyJSON
+	}
+	return nil
+}
+
+func (a *KeyInternalAPI) uploadLocalDeviceKeys(ctx context.Context, req *api.PerformUploadKeysRequest, res *api.PerformUploadKeysResponse) {
+	var keysToStore []api.DeviceMessage
 	// assert that the user ID / device ID are not lying for each key
 	for _, key := range req.DeviceKeys {
+		_, serverName, err := gomatrixserverlib.SplitID('@', key.UserID)
+		if err != nil {
+			continue // ignore invalid users
+		}
+		if serverName != a.ThisServer {
+			continue // ignore remote users
+		}
+		if len(key.KeyJSON) == 0 {
+			keysToStore = append(keysToStore, key.WithStreamID(0))
+			continue // deleted keys don't need sanity checking
+		}
 		gotUserID := gjson.GetBytes(key.KeyJSON, "user_id").Str
 		gotDeviceID := gjson.GetBytes(key.KeyJSON, "device_id").Str
 		if gotUserID == key.UserID && gotDeviceID == key.DeviceID {
-			keysToStore = append(keysToStore, key)
+			keysToStore = append(keysToStore, key.WithStreamID(0))
 			continue
 		}
 
@@ -282,12 +477,15 @@ func (a *KeyInternalAPI) uploadDeviceKeys(ctx context.Context, req *api.PerformU
 			),
 		})
 	}
+
 	// get existing device keys so we can check for changes
-	existingKeys := make([]api.DeviceKeys, len(keysToStore))
+	existingKeys := make([]api.DeviceMessage, len(keysToStore))
 	for i := range keysToStore {
-		existingKeys[i] = api.DeviceKeys{
-			UserID:   keysToStore[i].UserID,
-			DeviceID: keysToStore[i].DeviceID,
+		existingKeys[i] = api.DeviceMessage{
+			DeviceKeys: api.DeviceKeys{
+				UserID:   keysToStore[i].UserID,
+				DeviceID: keysToStore[i].DeviceID,
+			},
 		}
 	}
 	if err := a.DB.DeviceKeysJSON(ctx, existingKeys); err != nil {
@@ -296,14 +494,19 @@ func (a *KeyInternalAPI) uploadDeviceKeys(ctx context.Context, req *api.PerformU
 		}
 		return
 	}
+	if req.OnlyDisplayNameUpdates {
+		// add the display name field from keysToStore into existingKeys
+		keysToStore = appendDisplayNames(existingKeys, keysToStore)
+	}
 	// store the device keys and emit changes
-	if err := a.DB.StoreDeviceKeys(ctx, keysToStore); err != nil {
+	err := a.DB.StoreLocalDeviceKeys(ctx, keysToStore)
+	if err != nil {
 		res.Error = &api.KeyError{
 			Err: fmt.Sprintf("failed to store device keys: %s", err.Error()),
 		}
 		return
 	}
-	err := a.emitDeviceKeyChanges(existingKeys, keysToStore)
+	err = emitDeviceKeyChanges(a.Producer, existingKeys, keysToStore)
 	if err != nil {
 		util.GetLogger(ctx).Errorf("Failed to emitDeviceKeyChanges: %s", err)
 	}
@@ -348,13 +551,15 @@ func (a *KeyInternalAPI) uploadOneTimeKeys(ctx context.Context, req *api.Perform
 
 }
 
-func (a *KeyInternalAPI) emitDeviceKeyChanges(existing, new []api.DeviceKeys) error {
+func emitDeviceKeyChanges(producer KeyChangeProducer, existing, new []api.DeviceMessage) error {
 	// find keys in new that are not in existing
-	var keysAdded []api.DeviceKeys
+	var keysAdded []api.DeviceMessage
 	for _, newKey := range new {
 		exists := false
 		for _, existingKey := range existing {
-			if bytes.Equal(existingKey.KeyJSON, newKey.KeyJSON) {
+			// Do not treat the absence of keys as equal, or else we will not emit key changes
+			// when users delete devices which never had a key to begin with as both KeyJSONs are nil.
+			if bytes.Equal(existingKey.KeyJSON, newKey.KeyJSON) && len(existingKey.KeyJSON) > 0 {
 				exists = true
 				break
 			}
@@ -363,5 +568,18 @@ func (a *KeyInternalAPI) emitDeviceKeyChanges(existing, new []api.DeviceKeys) er
 			keysAdded = append(keysAdded, newKey)
 		}
 	}
-	return a.Producer.ProduceKeyChanges(keysAdded)
+	return producer.ProduceKeyChanges(keysAdded)
+}
+
+func appendDisplayNames(existing, new []api.DeviceMessage) []api.DeviceMessage {
+	for i, existingDevice := range existing {
+		for _, newDevice := range new {
+			if existingDevice.DeviceID != newDevice.DeviceID {
+				continue
+			}
+			existingDevice.DisplayName = newDevice.DisplayName
+			existing[i] = existingDevice
+		}
+	}
+	return existing
 }

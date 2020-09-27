@@ -22,6 +22,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/matrix-org/dendrite/eduserver/cache"
+	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/sqlutil"
 	"github.com/matrix-org/dendrite/syncapi/storage/shared"
 )
@@ -30,22 +31,21 @@ import (
 // both the database for PDUs and caches for EDUs.
 type SyncServerDatasource struct {
 	shared.Database
-	db *sql.DB
+	db     *sql.DB
+	writer sqlutil.Writer
 	sqlutil.PartitionOffsetStatements
 	streamID streamIDStatements
 }
 
 // NewDatabase creates a new sync server database
 // nolint: gocyclo
-func NewDatabase(dataSourceName string) (*SyncServerDatasource, error) {
+func NewDatabase(dbProperties *config.DatabaseOptions) (*SyncServerDatasource, error) {
 	var d SyncServerDatasource
-	cs, err := sqlutil.ParseFileURI(dataSourceName)
-	if err != nil {
+	var err error
+	if d.db, err = sqlutil.Open(dbProperties); err != nil {
 		return nil, err
 	}
-	if d.db, err = sqlutil.Open(sqlutil.SQLiteDriverName(), cs, nil); err != nil {
-		return nil, err
-	}
+	d.writer = sqlutil.NewExclusiveWriter()
 	if err = d.prepare(); err != nil {
 		return nil, err
 	}
@@ -53,7 +53,7 @@ func NewDatabase(dataSourceName string) (*SyncServerDatasource, error) {
 }
 
 func (d *SyncServerDatasource) prepare() (err error) {
-	if err = d.PartitionOffsetStatements.Prepare(d.db, "syncapi"); err != nil {
+	if err = d.PartitionOffsetStatements.Prepare(d.db, d.writer, "syncapi"); err != nil {
 		return err
 	}
 	if err = d.streamID.prepare(d.db); err != nil {
@@ -75,6 +75,10 @@ func (d *SyncServerDatasource) prepare() (err error) {
 	if err != nil {
 		return err
 	}
+	peeks, err := NewSqlitePeeksTable(d.db, &d.streamID)
+	if err != nil {
+		return err
+	}
 	topology, err := NewSqliteTopologyTable(d.db)
 	if err != nil {
 		return err
@@ -93,7 +97,9 @@ func (d *SyncServerDatasource) prepare() (err error) {
 	}
 	d.Database = shared.Database{
 		DB:                  d.db,
+		Writer:              d.writer,
 		Invites:             invites,
+		Peeks:               peeks,
 		AccountData:         accountData,
 		OutputEvents:        events,
 		BackwardExtremities: bwExtrem,
@@ -101,7 +107,6 @@ func (d *SyncServerDatasource) prepare() (err error) {
 		Topology:            topology,
 		Filter:              filter,
 		SendToDevice:        sendToDevice,
-		SendToDeviceWriter:  sqlutil.NewTransactionWriter(),
 		EDUCache:            cache.New(),
 	}
 	return nil

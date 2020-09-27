@@ -24,14 +24,16 @@ func (n *Node) CreateClient(
 	tr.RegisterProtocol(
 		"matrix", &yggroundtripper{
 			inner: &http.Transport{
-				TLSHandshakeTimeout:   20 * time.Second,
+				MaxIdleConns:          -1,
+				MaxIdleConnsPerHost:   -1,
+				TLSHandshakeTimeout:   10 * time.Second,
 				ResponseHeaderTimeout: 10 * time.Second,
-				IdleConnTimeout:       60 * time.Second,
+				IdleConnTimeout:       30 * time.Second,
 				DialContext:           n.DialerContext,
 			},
 		},
 	)
-	return gomatrixserverlib.NewClientWithTransport(tr)
+	return gomatrixserverlib.NewClientWithTransport(true, tr)
 }
 
 func (n *Node) CreateFederationClient(
@@ -41,15 +43,18 @@ func (n *Node) CreateFederationClient(
 	tr.RegisterProtocol(
 		"matrix", &yggroundtripper{
 			inner: &http.Transport{
-				TLSHandshakeTimeout:   20 * time.Second,
+				MaxIdleConns:          -1,
+				MaxIdleConnsPerHost:   -1,
+				TLSHandshakeTimeout:   10 * time.Second,
 				ResponseHeaderTimeout: 10 * time.Second,
-				IdleConnTimeout:       60 * time.Second,
+				IdleConnTimeout:       30 * time.Second,
 				DialContext:           n.DialerContext,
 				TLSClientConfig:       n.tlsConfig,
 			},
 		},
 	)
 	return gomatrixserverlib.NewFederationClientWithTransport(
-		base.Cfg.Matrix.ServerName, base.Cfg.Matrix.KeyID, base.Cfg.Matrix.PrivateKey, tr,
+		base.Cfg.Global.ServerName, base.Cfg.Global.KeyID,
+		base.Cfg.Global.PrivateKey, true, tr,
 	)
 }

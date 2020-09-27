@@ -21,8 +21,8 @@ import (
 	"fmt"
 	"syscall/js"
 
+	"github.com/gorilla/mux"
 	"github.com/matrix-org/dendrite/appservice"
-	"github.com/matrix-org/dendrite/currentstateserver"
 	"github.com/matrix-org/dendrite/eduserver"
 	"github.com/matrix-org/dendrite/eduserver/cache"
 	"github.com/matrix-org/dendrite/federationsender"
@@ -139,16 +139,16 @@ func createFederationClient(cfg *config.Dendrite, node *go_http_js_libp2p.P2pLoc
 	tr := go_http_js_libp2p.NewP2pTransport(node)
 
 	fed := gomatrixserverlib.NewFederationClient(
-		cfg.Matrix.ServerName, cfg.Matrix.KeyID, cfg.Matrix.PrivateKey,
+		cfg.Global.ServerName, cfg.Global.KeyID, cfg.Global.PrivateKey, true,
 	)
-	fed.Client = *gomatrixserverlib.NewClientWithTransport(tr)
+	fed.Client = *gomatrixserverlib.NewClientWithTransport(true, tr)
 
 	return fed
 }
 
 func createClient(node *go_http_js_libp2p.P2pLocalNode) *gomatrixserverlib.Client {
 	tr := go_http_js_libp2p.NewP2pTransport(node)
-	return gomatrixserverlib.NewClientWithTransport(tr)
+	return gomatrixserverlib.NewClientWithTransport(true, tr)
 }
 
 func createP2PNode(privKey ed25519.PrivateKey) (serverName string, node *go_http_js_libp2p.P2pLocalNode) {
@@ -161,31 +161,26 @@ func createP2PNode(privKey ed25519.PrivateKey) (serverName string, node *go_http
 
 func main() {
 	cfg := &config.Dendrite{}
-	cfg.SetDefaults()
-	cfg.Kafka.UseNaffka = true
-	cfg.Database.Account = "file:/idb/dendritejs_account.db"
-	cfg.Database.AppService = "file:/idb/dendritejs_appservice.db"
-	cfg.Database.Device = "file:/idb/dendritejs_device.db"
-	cfg.Database.FederationSender = "file:/idb/dendritejs_fedsender.db"
-	cfg.Database.MediaAPI = "file:/idb/dendritejs_mediaapi.db"
-	cfg.Database.Naffka = "file:/idb/dendritejs_naffka.db"
-	cfg.Database.RoomServer = "file:/idb/dendritejs_roomserver.db"
-	cfg.Database.ServerKey = "file:/idb/dendritejs_serverkey.db"
-	cfg.Database.SyncAPI = "file:/idb/dendritejs_syncapi.db"
-	cfg.Database.CurrentState = "file:/idb/dendritejs_currentstate.db"
-	cfg.Database.E2EKey = "file:/idb/dendritejs_e2ekey.db"
-	cfg.Kafka.Topics.OutputTypingEvent = "output_typing_event"
-	cfg.Kafka.Topics.OutputSendToDeviceEvent = "output_send_to_device_event"
-	cfg.Kafka.Topics.OutputClientData = "output_client_data"
-	cfg.Kafka.Topics.OutputRoomEvent = "output_room_event"
-	cfg.Matrix.TrustedIDServers = []string{
+	cfg.Defaults()
+	cfg.UserAPI.AccountDatabase.ConnectionString = "file:/idb/dendritejs_account.db"
+	cfg.AppServiceAPI.Database.ConnectionString = "file:/idb/dendritejs_appservice.db"
+	cfg.UserAPI.DeviceDatabase.ConnectionString = "file:/idb/dendritejs_device.db"
+	cfg.FederationSender.Database.ConnectionString = "file:/idb/dendritejs_fedsender.db"
+	cfg.MediaAPI.Database.ConnectionString = "file:/idb/dendritejs_mediaapi.db"
+	cfg.RoomServer.Database.ConnectionString = "file:/idb/dendritejs_roomserver.db"
+	cfg.ServerKeyAPI.Database.ConnectionString = "file:/idb/dendritejs_serverkey.db"
+	cfg.SyncAPI.Database.ConnectionString = "file:/idb/dendritejs_syncapi.db"
+	cfg.KeyServer.Database.ConnectionString = "file:/idb/dendritejs_e2ekey.db"
+	cfg.Global.Kafka.UseNaffka = true
+	cfg.Global.Kafka.Database.ConnectionString = "file:/idb/dendritejs_naffka.db"
+	cfg.Global.TrustedIDServers = []string{
 		"matrix.org", "vector.im",
 	}
-	cfg.Matrix.KeyID = libp2pMatrixKeyID
-	cfg.Matrix.PrivateKey = generateKey()
+	cfg.Global.KeyID = libp2pMatrixKeyID
+	cfg.Global.PrivateKey = generateKey()
 
-	serverName, node := createP2PNode(cfg.Matrix.PrivateKey)
-	cfg.Matrix.ServerName = gomatrixserverlib.ServerName(serverName)
+	serverName, node := createP2PNode(cfg.Global.PrivateKey)
+	cfg.Global.ServerName = gomatrixserverlib.ServerName(serverName)
 
 	if err := cfg.Derive(); err != nil {
 		logrus.Fatalf("Failed to derive values from config: %s", err)
@@ -194,9 +189,10 @@ func main() {
 	defer base.Close() // nolint: errcheck
 
 	accountDB := base.CreateAccountsDB()
-	deviceDB := base.CreateDeviceDB()
 	federation := createFederationClient(cfg, node)
-	userAPI := userapi.NewInternalAPI(accountDB, deviceDB, cfg.Matrix.ServerName, nil)
+	keyAPI := keyserver.NewInternalAPI(&base.Cfg.KeyServer, federation, base.KafkaProducer)
+	userAPI := userapi.NewInternalAPI(accountDB, &cfg.UserAPI, nil, keyAPI)
+	keyAPI.SetUserAPI(userAPI)
 
 	fetcher := &libp2pKeyFetcher{}
 	keyRing := gomatrixserverlib.KeyRing{
@@ -206,7 +202,7 @@ func main() {
 		KeyDatabase: fetcher,
 	}
 
-	rsAPI := roomserver.NewInternalAPI(base, keyRing, federation)
+	rsAPI := roomserver.NewInternalAPI(base, keyRing)
 	eduInputAPI := eduserver.NewInternalAPI(base, cache.New(), userAPI)
 	asQuery := appservice.NewInternalAPI(
 		base, userAPI, rsAPI,
@@ -215,12 +211,9 @@ func main() {
 	rsAPI.SetFederationSenderAPI(fedSenderAPI)
 	p2pPublicRoomProvider := NewLibP2PPublicRoomsProvider(node, fedSenderAPI, federation)
 
-	stateAPI := currentstateserver.NewInternalAPI(base.Cfg, base.KafkaConsumer)
-
 	monolith := setup.Monolith{
 		Config:        base.Cfg,
 		AccountDB:     accountDB,
-		DeviceDB:      deviceDB,
 		Client:        createClient(node),
 		FedClient:     federation,
 		KeyRing:       &keyRing,
@@ -231,28 +224,33 @@ func main() {
 		EDUInternalAPI:      eduInputAPI,
 		FederationSenderAPI: fedSenderAPI,
 		RoomserverAPI:       rsAPI,
-		StateAPI:            stateAPI,
 		UserAPI:             userAPI,
-		KeyAPI:              keyserver.NewInternalAPI(base.Cfg, federation, userAPI, base.KafkaProducer),
+		KeyAPI:              keyAPI,
 		//ServerKeyAPI:        serverKeyAPI,
 		ExtPublicRoomsProvider: p2pPublicRoomProvider,
 	}
-	monolith.AddAllPublicRoutes(base.PublicAPIMux)
-
-	httputil.SetupHTTPAPI(
-		base.BaseMux,
-		base.PublicAPIMux,
-		base.InternalAPIMux,
-		cfg,
-		base.UseHTTPAPIs,
+	monolith.AddAllPublicRoutes(
+		base.PublicClientAPIMux,
+		base.PublicFederationAPIMux,
+		base.PublicKeyAPIMux,
+		base.PublicMediaAPIMux,
 	)
+
+	httpRouter := mux.NewRouter().SkipClean(true).UseEncodedPath()
+	httpRouter.PathPrefix(httputil.InternalPathPrefix).Handler(base.InternalAPIMux)
+	httpRouter.PathPrefix(httputil.PublicClientPathPrefix).Handler(base.PublicClientAPIMux)
+	httpRouter.PathPrefix(httputil.PublicMediaPathPrefix).Handler(base.PublicMediaAPIMux)
+
+	libp2pRouter := mux.NewRouter().SkipClean(true).UseEncodedPath()
+	libp2pRouter.PathPrefix(httputil.PublicFederationPathPrefix).Handler(base.PublicFederationAPIMux)
+	libp2pRouter.PathPrefix(httputil.PublicMediaPathPrefix).Handler(base.PublicMediaAPIMux)
 
 	// Expose the matrix APIs via libp2p-js - for federation traffic
 	if node != nil {
 		go func() {
 			logrus.Info("Listening on libp2p-js host ID ", node.Id)
 			s := JSServer{
-				Mux: base.BaseMux,
+				Mux: libp2pRouter,
 			}
 			s.ListenAndServe("p2p")
 		}()
@@ -262,7 +260,7 @@ func main() {
 	go func() {
 		logrus.Info("Listening for service-worker fetch traffic")
 		s := JSServer{
-			Mux: base.BaseMux,
+			Mux: httpRouter,
 		}
 		s.ListenAndServe("fetch")
 	}()

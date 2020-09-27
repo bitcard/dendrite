@@ -37,14 +37,15 @@ type OutputClientDataConsumer struct {
 
 // NewOutputClientDataConsumer creates a new OutputClientData consumer. Call Start() to begin consuming from room servers.
 func NewOutputClientDataConsumer(
-	cfg *config.Dendrite,
+	cfg *config.SyncAPI,
 	kafkaConsumer sarama.Consumer,
 	n *sync.Notifier,
 	store storage.Database,
 ) *OutputClientDataConsumer {
 
 	consumer := internal.ContinualConsumer{
-		Topic:          string(cfg.Kafka.Topics.OutputClientData),
+		ComponentName:  "syncapi/clientapi",
+		Topic:          string(cfg.Matrix.Kafka.TopicFor(config.TopicOutputClientData)),
 		Consumer:       kafkaConsumer,
 		PartitionStore: store,
 	}
@@ -91,7 +92,7 @@ func (s *OutputClientDataConsumer) onMessage(msg *sarama.ConsumerMessage) error 
 		}).Panicf("could not save account data")
 	}
 
-	s.notifier.OnNewEvent(nil, "", []string{string(msg.Key)}, types.NewStreamToken(pduPos, 0))
+	s.notifier.OnNewEvent(nil, "", []string{string(msg.Key)}, types.NewStreamToken(pduPos, 0, nil))
 
 	return nil
 }

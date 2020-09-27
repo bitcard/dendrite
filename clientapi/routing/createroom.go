@@ -135,7 +135,7 @@ type fledglingEvent struct {
 // CreateRoom implements /createRoom
 func CreateRoom(
 	req *http.Request, device *api.Device,
-	cfg *config.Dendrite,
+	cfg *config.ClientAPI,
 	accountDB accounts.Database, rsAPI roomserverAPI.RoomserverInternalAPI,
 	asAPI appserviceAPI.AppServiceQueryAPI,
 ) util.JSONResponse {
@@ -149,7 +149,7 @@ func CreateRoom(
 // nolint: gocyclo
 func createRoom(
 	req *http.Request, device *api.Device,
-	cfg *config.Dendrite, roomID string,
+	cfg *config.ClientAPI, roomID string,
 	accountDB accounts.Database, rsAPI roomserverAPI.RoomserverInternalAPI,
 	asAPI appserviceAPI.AppServiceQueryAPI,
 ) util.JSONResponse {
@@ -342,8 +342,7 @@ func createRoom(
 	}
 
 	// send events to the room server
-	_, err = roomserverAPI.SendEvents(req.Context(), rsAPI, builtEvents, cfg.Matrix.ServerName, nil)
-	if err != nil {
+	if err = roomserverAPI.SendEvents(req.Context(), rsAPI, builtEvents, cfg.Matrix.ServerName, nil); err != nil {
 		util.GetLogger(req.Context()).WithError(err).Error("SendEvents failed")
 		return jsonerror.InternalServerError()
 	}
@@ -371,42 +370,63 @@ func createRoom(
 	}
 
 	// If this is a direct message then we should invite the participants.
-	for _, invitee := range r.Invite {
-		// Build the invite event.
-		inviteEvent, err := buildMembershipEvent(
-			req.Context(), invitee, "", accountDB, device, gomatrixserverlib.Invite,
-			roomID, true, cfg, evTime, rsAPI, asAPI,
-		)
-		if err != nil {
-			util.GetLogger(req.Context()).WithError(err).Error("buildMembershipEvent failed")
-			continue
-		}
+	if len(r.Invite) > 0 {
 		// Build some stripped state for the invite.
-		candidates := append(gomatrixserverlib.UnwrapEventHeaders(builtEvents), inviteEvent.Event)
-		var strippedState []gomatrixserverlib.InviteV2StrippedState
-		for _, event := range candidates {
+		var globalStrippedState []gomatrixserverlib.InviteV2StrippedState
+		for _, event := range builtEvents {
 			switch event.Type() {
-			// TODO: case gomatrixserverlib.MRoomEncryption:
-			//	fallthrough
+			case gomatrixserverlib.MRoomName:
+				fallthrough
+			case gomatrixserverlib.MRoomCanonicalAlias:
+				fallthrough
+			case "m.room.encryption": // TODO: move this to gmsl
+				fallthrough
 			case gomatrixserverlib.MRoomMember:
 				fallthrough
 			case gomatrixserverlib.MRoomJoinRules:
-				strippedState = append(
-					strippedState,
-					gomatrixserverlib.NewInviteV2StrippedState(&event),
+				ev := event.Event
+				globalStrippedState = append(
+					globalStrippedState,
+					gomatrixserverlib.NewInviteV2StrippedState(&ev),
 				)
 			}
 		}
-		// Send the invite event to the roomserver.
-		if perr := roomserverAPI.SendInvite(
-			req.Context(), rsAPI,
-			inviteEvent.Headered(roomVersion),
-			strippedState,         // invite room state
-			cfg.Matrix.ServerName, // send as server
-			nil,                   // transaction ID
-		); perr != nil {
-			util.GetLogger(req.Context()).WithError(perr).Error("SendInvite failed")
-			return perr.JSONResponse()
+
+		// Process the invites.
+		for _, invitee := range r.Invite {
+			// Build the invite event.
+			inviteEvent, err := buildMembershipEvent(
+				req.Context(), invitee, "", accountDB, device, gomatrixserverlib.Invite,
+				roomID, true, cfg, evTime, rsAPI, asAPI,
+			)
+			if err != nil {
+				util.GetLogger(req.Context()).WithError(err).Error("buildMembershipEvent failed")
+				continue
+			}
+			inviteStrippedState := append(
+				globalStrippedState,
+				gomatrixserverlib.NewInviteV2StrippedState(&inviteEvent.Event),
+			)
+			// Send the invite event to the roomserver.
+			err = roomserverAPI.SendInvite(
+				req.Context(),
+				rsAPI,
+				inviteEvent.Headered(roomVersion),
+				inviteStrippedState,   // invite room state
+				cfg.Matrix.ServerName, // send as server
+				nil,                   // transaction ID
+			)
+			switch e := err.(type) {
+			case *roomserverAPI.PerformError:
+				return e.JSONResponse()
+			case nil:
+			default:
+				util.GetLogger(req.Context()).WithError(err).Error("roomserverAPI.SendInvite failed")
+				return util.JSONResponse{
+					Code: http.StatusInternalServerError,
+					JSON: jsonerror.InternalServerError(),
+				}
+			}
 		}
 	}
 
@@ -438,7 +458,7 @@ func createRoom(
 func buildEvent(
 	builder *gomatrixserverlib.EventBuilder,
 	provider gomatrixserverlib.AuthEventProvider,
-	cfg *config.Dendrite,
+	cfg *config.ClientAPI,
 	evTime time.Time,
 	roomVersion gomatrixserverlib.RoomVersion,
 ) (*gomatrixserverlib.Event, error) {

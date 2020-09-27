@@ -20,6 +20,7 @@ import (
 	"database/sql"
 
 	// Import the postgres database driver.
+	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/sqlutil"
 	"github.com/matrix-org/dendrite/mediaapi/types"
 	"github.com/matrix-org/gomatrixserverlib"
@@ -30,20 +31,19 @@ import (
 type Database struct {
 	statements statements
 	db         *sql.DB
+	writer     sqlutil.Writer
 }
 
 // Open opens a postgres database.
-func Open(dataSourceName string) (*Database, error) {
-	var d Database
+func Open(dbProperties *config.DatabaseOptions) (*Database, error) {
+	d := Database{
+		writer: sqlutil.NewExclusiveWriter(),
+	}
 	var err error
-	cs, err := sqlutil.ParseFileURI(dataSourceName)
-	if err != nil {
+	if d.db, err = sqlutil.Open(dbProperties); err != nil {
 		return nil, err
 	}
-	if d.db, err = sqlutil.Open(sqlutil.SQLiteDriverName(), cs, nil); err != nil {
-		return nil, err
-	}
-	if err = d.statements.prepare(d.db); err != nil {
+	if err = d.statements.prepare(d.db, d.writer); err != nil {
 		return nil, err
 	}
 	return &d, nil
@@ -64,6 +64,19 @@ func (d *Database) GetMediaMetadata(
 	ctx context.Context, mediaID types.MediaID, mediaOrigin gomatrixserverlib.ServerName,
 ) (*types.MediaMetadata, error) {
 	mediaMetadata, err := d.statements.media.selectMedia(ctx, mediaID, mediaOrigin)
+	if err != nil && err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return mediaMetadata, err
+}
+
+// GetMediaMetadataByHash returns metadata about media stored on this server.
+// The media could have been uploaded to this server or fetched from another server and cached here.
+// Returns nil metadata if there is no metadata associated with this media.
+func (d *Database) GetMediaMetadataByHash(
+	ctx context.Context, mediaHash types.Base64Hash, mediaOrigin gomatrixserverlib.ServerName,
+) (*types.MediaMetadata, error) {
+	mediaMetadata, err := d.statements.media.selectMediaByHash(ctx, mediaHash, mediaOrigin)
 	if err != nil && err == sql.ErrNoRows {
 		return nil, nil
 	}

@@ -89,25 +89,32 @@ func (t *testRoomserverAPI) InputRoomEvents(
 	ctx context.Context,
 	request *api.InputRoomEventsRequest,
 	response *api.InputRoomEventsResponse,
-) error {
+) {
 	t.inputRoomEvents = append(t.inputRoomEvents, request.InputRoomEvents...)
 	for _, ire := range request.InputRoomEvents {
 		fmt.Println("InputRoomEvents: ", ire.Event.EventID())
 	}
-	return nil
 }
 
 func (t *testRoomserverAPI) PerformInvite(
 	ctx context.Context,
 	req *api.PerformInviteRequest,
 	res *api.PerformInviteResponse,
-) {
+) error {
+	return nil
 }
 
 func (t *testRoomserverAPI) PerformJoin(
 	ctx context.Context,
 	req *api.PerformJoinRequest,
 	res *api.PerformJoinResponse,
+) {
+}
+
+func (t *testRoomserverAPI) PerformPeek(
+	ctx context.Context,
+	req *api.PerformPeekRequest,
+	res *api.PerformPeekResponse,
 ) {
 }
 
@@ -188,6 +195,15 @@ func (t *testRoomserverAPI) QueryMembershipsForRoom(
 	ctx context.Context,
 	request *api.QueryMembershipsForRoomRequest,
 	response *api.QueryMembershipsForRoomResponse,
+) error {
+	return fmt.Errorf("not implemented")
+}
+
+// Query if a server is joined to a room
+func (t *testRoomserverAPI) QueryServerJoinedToRoom(
+	ctx context.Context,
+	request *api.QueryServerJoinedToRoomRequest,
+	response *api.QueryServerJoinedToRoomResponse,
 ) error {
 	return fmt.Errorf("not implemented")
 }
@@ -294,6 +310,30 @@ func (t *testRoomserverAPI) RemoveRoomAlias(
 	return fmt.Errorf("not implemented")
 }
 
+func (t *testRoomserverAPI) QueryCurrentState(ctx context.Context, req *api.QueryCurrentStateRequest, res *api.QueryCurrentStateResponse) error {
+	return nil
+}
+
+func (t *testRoomserverAPI) QueryRoomsForUser(ctx context.Context, req *api.QueryRoomsForUserRequest, res *api.QueryRoomsForUserResponse) error {
+	return fmt.Errorf("not implemented")
+}
+
+func (t *testRoomserverAPI) QueryBulkStateContent(ctx context.Context, req *api.QueryBulkStateContentRequest, res *api.QueryBulkStateContentResponse) error {
+	return fmt.Errorf("not implemented")
+}
+
+func (t *testRoomserverAPI) QuerySharedUsers(ctx context.Context, req *api.QuerySharedUsersRequest, res *api.QuerySharedUsersResponse) error {
+	return fmt.Errorf("not implemented")
+}
+
+func (t *testRoomserverAPI) QueryKnownUsers(ctx context.Context, req *api.QueryKnownUsersRequest, res *api.QueryKnownUsersResponse) error {
+	return fmt.Errorf("not implemented")
+}
+
+func (t *testRoomserverAPI) QueryServerBannedFromRoom(ctx context.Context, req *api.QueryServerBannedFromRoomRequest, res *api.QueryServerBannedFromRoomResponse) error {
+	return nil
+}
+
 type txnFedClient struct {
 	state            map[string]gomatrixserverlib.RespState    // event_id to response
 	stateIDs         map[string]gomatrixserverlib.RespStateIDs // event_id to response
@@ -340,7 +380,6 @@ func (c *txnFedClient) LookupMissingEvents(ctx context.Context, s gomatrixserver
 
 func mustCreateTransaction(rsAPI api.RoomserverInternalAPI, fedClient txnFederationClient, pdus []json.RawMessage) *txnReq {
 	t := &txnReq{
-		context:    context.Background(),
 		rsAPI:      rsAPI,
 		eduAPI:     &testEDUProducer{},
 		keys:       &test.NopJSONVerifier{},
@@ -356,7 +395,7 @@ func mustCreateTransaction(rsAPI api.RoomserverInternalAPI, fedClient txnFederat
 }
 
 func mustProcessTransaction(t *testing.T, txn *txnReq, pdusWithErrors []string) {
-	res, err := txn.processTransaction()
+	res, err := txn.processTransaction(context.Background())
 	if err != nil {
 		t.Errorf("txn.processTransaction returned an error: %v", err)
 		return
@@ -430,7 +469,8 @@ func TestBasicTransaction(t *testing.T) {
 	assertInputRoomEvents(t, rsAPI.inputRoomEvents, []gomatrixserverlib.HeaderedEvent{testEvents[len(testEvents)-1]})
 }
 
-// The purpose of this test is to check that if the event received fails auth checks the transaction is failed.
+// The purpose of this test is to check that if the event received fails auth checks the event is still sent to the roomserver
+// as it does the auth check.
 func TestTransactionFailAuthChecks(t *testing.T) {
 	rsAPI := &testRoomserverAPI{
 		queryStateAfterEvents: func(req *api.QueryStateAfterEventsRequest) api.QueryStateAfterEventsResponse {
@@ -448,11 +488,9 @@ func TestTransactionFailAuthChecks(t *testing.T) {
 		testData[len(testData)-1], // a message event
 	}
 	txn := mustCreateTransaction(rsAPI, &txnFedClient{}, pdus)
-	mustProcessTransaction(t, txn, []string{
-		// expect the event to have an error
-		testEvents[len(testEvents)-1].EventID(),
-	})
-	assertInputRoomEvents(t, rsAPI.inputRoomEvents, nil) // expect no messages to be sent to the roomserver
+	mustProcessTransaction(t, txn, []string{})
+	// expect message to be sent to the roomserver
+	assertInputRoomEvents(t, rsAPI.inputRoomEvents, []gomatrixserverlib.HeaderedEvent{testEvents[len(testEvents)-1]})
 }
 
 // The purpose of this test is to make sure that when an event is received for which we do not know the prev_events,

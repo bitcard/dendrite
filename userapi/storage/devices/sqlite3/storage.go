@@ -20,6 +20,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 
+	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/sqlutil"
 	"github.com/matrix-org/dendrite/userapi/api"
 	"github.com/matrix-org/gomatrixserverlib"
@@ -33,25 +34,22 @@ var deviceIDByteLength = 6
 // Database represents a device database.
 type Database struct {
 	db      *sql.DB
+	writer  sqlutil.Writer
 	devices devicesStatements
 }
 
 // NewDatabase creates a new device database
-func NewDatabase(dataSourceName string, serverName gomatrixserverlib.ServerName) (*Database, error) {
-	var db *sql.DB
-	var err error
-	cs, err := sqlutil.ParseFileURI(dataSourceName)
+func NewDatabase(dbProperties *config.DatabaseOptions, serverName gomatrixserverlib.ServerName) (*Database, error) {
+	db, err := sqlutil.Open(dbProperties)
 	if err != nil {
 		return nil, err
 	}
-	if db, err = sqlutil.Open(sqlutil.SQLiteDriverName(), cs, nil); err != nil {
-		return nil, err
-	}
+	writer := sqlutil.NewExclusiveWriter()
 	d := devicesStatements{}
-	if err = d.prepare(db, serverName); err != nil {
+	if err = d.prepare(db, writer, serverName); err != nil {
 		return nil, err
 	}
-	return &Database{db, d}, nil
+	return &Database{db, writer, d}, nil
 }
 
 // GetDeviceByAccessToken returns the device matching the given access token.
@@ -74,7 +72,7 @@ func (d *Database) GetDeviceByID(
 func (d *Database) GetDevicesByLocalpart(
 	ctx context.Context, localpart string,
 ) ([]api.Device, error) {
-	return d.devices.selectDevicesByLocalpart(ctx, localpart)
+	return d.devices.selectDevicesByLocalpart(ctx, nil, localpart, "")
 }
 
 func (d *Database) GetDevicesByID(ctx context.Context, deviceIDs []string) ([]api.Device, error) {
@@ -92,7 +90,7 @@ func (d *Database) CreateDevice(
 	displayName *string,
 ) (dev *api.Device, returnErr error) {
 	if deviceID != nil {
-		returnErr = sqlutil.WithTransaction(d.db, func(txn *sql.Tx) error {
+		returnErr = d.writer.Do(d.db, nil, func(txn *sql.Tx) error {
 			var err error
 			// Revoke existing tokens for this device
 			if err = d.devices.deleteDevice(ctx, txn, *deviceID, localpart); err != nil {
@@ -112,7 +110,7 @@ func (d *Database) CreateDevice(
 				return
 			}
 
-			returnErr = sqlutil.WithTransaction(d.db, func(txn *sql.Tx) error {
+			returnErr = d.writer.Do(d.db, nil, func(txn *sql.Tx) error {
 				var err error
 				dev, err = d.devices.insertDevice(ctx, txn, newDeviceID, localpart, accessToken, displayName)
 				return err
@@ -142,7 +140,7 @@ func generateDeviceID() (string, error) {
 func (d *Database) UpdateDevice(
 	ctx context.Context, localpart, deviceID string, displayName *string,
 ) error {
-	return sqlutil.WithTransaction(d.db, func(txn *sql.Tx) error {
+	return d.writer.Do(d.db, nil, func(txn *sql.Tx) error {
 		return d.devices.updateDeviceName(ctx, txn, localpart, deviceID, displayName)
 	})
 }
@@ -154,7 +152,7 @@ func (d *Database) UpdateDevice(
 func (d *Database) RemoveDevice(
 	ctx context.Context, deviceID, localpart string,
 ) error {
-	return sqlutil.WithTransaction(d.db, func(txn *sql.Tx) error {
+	return d.writer.Do(d.db, nil, func(txn *sql.Tx) error {
 		if err := d.devices.deleteDevice(ctx, txn, deviceID, localpart); err != sql.ErrNoRows {
 			return err
 		}
@@ -169,7 +167,7 @@ func (d *Database) RemoveDevice(
 func (d *Database) RemoveDevices(
 	ctx context.Context, localpart string, devices []string,
 ) error {
-	return sqlutil.WithTransaction(d.db, func(txn *sql.Tx) error {
+	return d.writer.Do(d.db, nil, func(txn *sql.Tx) error {
 		if err := d.devices.deleteDevices(ctx, txn, localpart, devices); err != sql.ErrNoRows {
 			return err
 		}
@@ -181,12 +179,17 @@ func (d *Database) RemoveDevices(
 // database matching the given user ID localpart.
 // If something went wrong during the deletion, it will return the SQL error.
 func (d *Database) RemoveAllDevices(
-	ctx context.Context, localpart string,
-) error {
-	return sqlutil.WithTransaction(d.db, func(txn *sql.Tx) error {
-		if err := d.devices.deleteDevicesByLocalpart(ctx, txn, localpart); err != sql.ErrNoRows {
+	ctx context.Context, localpart, exceptDeviceID string,
+) (devices []api.Device, err error) {
+	err = d.writer.Do(d.db, nil, func(txn *sql.Tx) error {
+		devices, err = d.devices.selectDevicesByLocalpart(ctx, txn, localpart, exceptDeviceID)
+		if err != nil {
+			return err
+		}
+		if err := d.devices.deleteDevicesByLocalpart(ctx, txn, localpart, exceptDeviceID); err != sql.ErrNoRows {
 			return err
 		}
 		return nil
 	})
+	return
 }

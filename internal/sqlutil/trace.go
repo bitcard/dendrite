@@ -22,14 +22,19 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/ngrok/sqlmw"
 	"github.com/sirupsen/logrus"
 )
 
 var tracingEnabled = os.Getenv("DENDRITE_TRACE_SQL") == "1"
+var goidToWriter sync.Map
 
 type traceInterceptor struct {
 	sqlmw.NullInterceptor
@@ -39,6 +44,8 @@ func (in *traceInterceptor) StmtQueryContext(ctx context.Context, stmt driver.St
 	startedAt := time.Now()
 	rows, err := stmt.QueryContext(ctx, args)
 
+	trackGoID(query)
+
 	logrus.WithField("duration", time.Since(startedAt)).WithField(logrus.ErrorKey, err).Debug("executed sql query ", query, " args: ", args)
 
 	return rows, err
@@ -47,6 +54,8 @@ func (in *traceInterceptor) StmtQueryContext(ctx context.Context, stmt driver.St
 func (in *traceInterceptor) StmtExecContext(ctx context.Context, stmt driver.StmtExecContext, query string, args []driver.NamedValue) (driver.Result, error) {
 	startedAt := time.Now()
 	result, err := stmt.ExecContext(ctx, args)
+
+	trackGoID(query)
 
 	logrus.WithField("duration", time.Since(startedAt)).WithField(logrus.ErrorKey, err).Debug("executed sql query ", query, " args: ", args)
 
@@ -65,7 +74,7 @@ func (in *traceInterceptor) RowsNext(c context.Context, rows driver.Rows, dest [
 
 	b := strings.Builder{}
 	for i, val := range dest {
-		b.WriteString(fmt.Sprintf("%v", val))
+		b.WriteString(fmt.Sprintf("%q", val))
 		if i+1 <= len(dest)-1 {
 			b.WriteString(" | ")
 		}
@@ -74,10 +83,38 @@ func (in *traceInterceptor) RowsNext(c context.Context, rows driver.Rows, dest [
 	return err
 }
 
+func trackGoID(query string) {
+	thisGoID := goid()
+	if _, ok := goidToWriter.Load(thisGoID); ok {
+		return // we're on a writer goroutine
+	}
+
+	q := strings.TrimSpace(query)
+	if strings.HasPrefix(q, "SELECT") {
+		return // SELECTs can go on other goroutines
+	}
+	logrus.Warnf("unsafe goid: SQL executed not on an ExclusiveWriter: %s", q)
+}
+
 // Open opens a database specified by its database driver name and a driver-specific data source name,
 // usually consisting of at least a database name and connection information. Includes tracing driver
 // if DENDRITE_TRACE_SQL=1
-func Open(driverName, dsn string, dbProperties DbProperties) (*sql.DB, error) {
+func Open(dbProperties *config.DatabaseOptions) (*sql.DB, error) {
+	var err error
+	var driverName, dsn string
+	switch {
+	case dbProperties.ConnectionString.IsSQLite():
+		driverName = SQLiteDriverName()
+		dsn, err = ParseFileURI(dbProperties.ConnectionString)
+		if err != nil {
+			return nil, fmt.Errorf("ParseFileURI: %w", err)
+		}
+	case dbProperties.ConnectionString.IsPostgres():
+		driverName = "postgres"
+		dsn = string(dbProperties.ConnectionString)
+	default:
+		return nil, fmt.Errorf("invalid database connection string %q", dbProperties.ConnectionString)
+	}
 	if tracingEnabled {
 		// install the wrapped driver
 		driverName += "-trace"
@@ -86,11 +123,11 @@ func Open(driverName, dsn string, dbProperties DbProperties) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	if driverName != SQLiteDriverName() && dbProperties != nil {
+	if driverName != SQLiteDriverName() {
 		logrus.WithFields(logrus.Fields{
-			"MaxOpenConns":    dbProperties.MaxOpenConns(),
-			"MaxIdleConns":    dbProperties.MaxIdleConns(),
-			"ConnMaxLifetime": dbProperties.ConnMaxLifetime(),
+			"MaxOpenConns":    dbProperties.MaxOpenConns,
+			"MaxIdleConns":    dbProperties.MaxIdleConns,
+			"ConnMaxLifetime": dbProperties.ConnMaxLifetime,
 			"dataSourceName":  regexp.MustCompile(`://[^@]*@`).ReplaceAllLiteralString(dsn, "://"),
 		}).Debug("Setting DB connection limits")
 		db.SetMaxOpenConns(dbProperties.MaxOpenConns())
@@ -102,4 +139,15 @@ func Open(driverName, dsn string, dbProperties DbProperties) (*sql.DB, error) {
 
 func init() {
 	registerDrivers()
+}
+
+func goid() int {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	idField := strings.Fields(strings.TrimPrefix(string(buf[:n]), "goroutine "))[0]
+	id, err := strconv.Atoi(idField)
+	if err != nil {
+		panic(fmt.Sprintf("cannot get goroutine id: %v", err))
+	}
+	return id
 }

@@ -17,14 +17,13 @@ package keyserver
 import (
 	"github.com/Shopify/sarama"
 	"github.com/gorilla/mux"
+	fedsenderapi "github.com/matrix-org/dendrite/federationsender/api"
 	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/keyserver/api"
 	"github.com/matrix-org/dendrite/keyserver/internal"
 	"github.com/matrix-org/dendrite/keyserver/inthttp"
 	"github.com/matrix-org/dendrite/keyserver/producers"
 	"github.com/matrix-org/dendrite/keyserver/storage"
-	userapi "github.com/matrix-org/dendrite/userapi/api"
-	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/sirupsen/logrus"
 )
 
@@ -37,25 +36,28 @@ func AddInternalRoutes(router *mux.Router, intAPI api.KeyInternalAPI) {
 // NewInternalAPI returns a concerete implementation of the internal API. Callers
 // can call functions directly on the returned API or via an HTTP interface using AddInternalRoutes.
 func NewInternalAPI(
-	cfg *config.Dendrite, fedClient *gomatrixserverlib.FederationClient, userAPI userapi.UserInternalAPI, producer sarama.SyncProducer,
+	cfg *config.KeyServer, fedClient fedsenderapi.FederationClient, producer sarama.SyncProducer,
 ) api.KeyInternalAPI {
-	db, err := storage.NewDatabase(
-		string(cfg.Database.E2EKey),
-		cfg.DbProperties(),
-	)
+	db, err := storage.NewDatabase(&cfg.Database)
 	if err != nil {
 		logrus.WithError(err).Panicf("failed to connect to key server database")
 	}
 	keyChangeProducer := &producers.KeyChange{
-		Topic:    string(cfg.Kafka.Topics.OutputKeyChangeEvent),
+		Topic:    string(cfg.Matrix.Kafka.TopicFor(config.TopicOutputKeyChangeEvent)),
 		Producer: producer,
 		DB:       db,
 	}
+	updater := internal.NewDeviceListUpdater(db, keyChangeProducer, fedClient, 8) // 8 workers TODO: configurable
+	go func() {
+		if err := updater.Start(); err != nil {
+			logrus.WithError(err).Panicf("failed to start device list updater")
+		}
+	}()
 	return &internal.KeyInternalAPI{
 		DB:         db,
 		ThisServer: cfg.Matrix.ServerName,
 		FedClient:  fedClient,
-		UserAPI:    userAPI,
 		Producer:   keyChangeProducer,
+		Updater:    updater,
 	}
 }

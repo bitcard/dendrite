@@ -23,16 +23,18 @@ func main() {
 	cfg := setup.ParseFlags(false)
 	base := setup.NewBaseDendrite(cfg, "RoomServerAPI", true)
 	defer base.Close() // nolint: errcheck
-	federation := base.CreateFederationClient()
 
 	serverKeyAPI := base.ServerKeyAPIClient()
 	keyRing := serverKeyAPI.KeyRing()
 
 	fsAPI := base.FederationSenderHTTPClient()
-	rsAPI := roomserver.NewInternalAPI(base, keyRing, federation)
+	rsAPI := roomserver.NewInternalAPI(base, keyRing)
 	rsAPI.SetFederationSenderAPI(fsAPI)
 	roomserver.AddInternalRoutes(base.InternalAPIMux, rsAPI)
 
-	base.SetupAndServeHTTP(string(base.Cfg.Bind.RoomServer), string(base.Cfg.Listen.RoomServer))
-
+	base.SetupAndServeHTTP(
+		base.Cfg.RoomServer.InternalAPI.Listen,
+		setup.NoExternalListener,
+		nil, nil,
+	)
 }

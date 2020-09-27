@@ -51,14 +51,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS syncapi_event_id_idx ON syncapi_current_room_s
 const upsertRoomStateSQL = "" +
 	"INSERT INTO syncapi_current_room_state (room_id, event_id, type, sender, contains_url, state_key, headered_event_json, membership, added_at)" +
 	" VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)" +
-	" ON CONFLICT (event_id, room_id, type, sender, contains_url)" +
+	" ON CONFLICT (room_id, type, state_key)" +
 	" DO UPDATE SET event_id = $2, sender=$4, contains_url=$5, headered_event_json = $7, membership = $8, added_at = $9"
 
 const deleteRoomStateByEventIDSQL = "" +
 	"DELETE FROM syncapi_current_room_state WHERE event_id = $1"
 
+const DeleteRoomStateForRoomSQL = "" +
+	"DELETE FROM syncapi_current_room_state WHERE event_id = $1"
+
 const selectRoomIDsWithMembershipSQL = "" +
-	"SELECT room_id FROM syncapi_current_room_state WHERE type = 'm.room.member' AND state_key = $1 AND membership = $2"
+	"SELECT DISTINCT room_id FROM syncapi_current_room_state WHERE type = 'm.room.member' AND state_key = $1 AND membership = $2"
 
 const selectCurrentStateSQL = "" +
 	"SELECT headered_event_json FROM syncapi_current_room_state WHERE room_id = $1" +
@@ -85,10 +88,10 @@ const selectEventsWithEventIDsSQL = "" +
 
 type currentRoomStateStatements struct {
 	db                              *sql.DB
-	writer                          *sqlutil.TransactionWriter
 	streamIDStatements              *streamIDStatements
 	upsertRoomStateStmt             *sql.Stmt
 	deleteRoomStateByEventIDStmt    *sql.Stmt
+	DeleteRoomStateForRoomStmt      *sql.Stmt
 	selectRoomIDsWithMembershipStmt *sql.Stmt
 	selectCurrentStateStmt          *sql.Stmt
 	selectJoinedUsersStmt           *sql.Stmt
@@ -98,7 +101,6 @@ type currentRoomStateStatements struct {
 func NewSqliteCurrentRoomStateTable(db *sql.DB, streamID *streamIDStatements) (tables.CurrentRoomState, error) {
 	s := &currentRoomStateStatements{
 		db:                 db,
-		writer:             sqlutil.NewTransactionWriter(),
 		streamIDStatements: streamID,
 	}
 	_, err := db.Exec(currentRoomStateSchema)
@@ -109,6 +111,9 @@ func NewSqliteCurrentRoomStateTable(db *sql.DB, streamID *streamIDStatements) (t
 		return nil, err
 	}
 	if s.deleteRoomStateByEventIDStmt, err = db.Prepare(deleteRoomStateByEventIDSQL); err != nil {
+		return nil, err
+	}
+	if s.DeleteRoomStateForRoomStmt, err = db.Prepare(DeleteRoomStateForRoomSQL); err != nil {
 		return nil, err
 	}
 	if s.selectRoomIDsWithMembershipStmt, err = db.Prepare(selectRoomIDsWithMembershipSQL); err != nil {
@@ -200,11 +205,17 @@ func (s *currentRoomStateStatements) SelectCurrentState(
 func (s *currentRoomStateStatements) DeleteRoomStateByEventID(
 	ctx context.Context, txn *sql.Tx, eventID string,
 ) error {
-	return s.writer.Do(s.db, txn, func(txn *sql.Tx) error {
-		stmt := sqlutil.TxStmt(txn, s.deleteRoomStateByEventIDStmt)
-		_, err := stmt.ExecContext(ctx, eventID)
-		return err
-	})
+	stmt := sqlutil.TxStmt(txn, s.deleteRoomStateByEventIDStmt)
+	_, err := stmt.ExecContext(ctx, eventID)
+	return err
+}
+
+func (s *currentRoomStateStatements) DeleteRoomStateForRoom(
+	ctx context.Context, txn *sql.Tx, roomID string,
+) error {
+	stmt := sqlutil.TxStmt(txn, s.DeleteRoomStateForRoomStmt)
+	_, err := stmt.ExecContext(ctx, roomID)
+	return err
 }
 
 func (s *currentRoomStateStatements) UpsertRoomState(
@@ -225,22 +236,20 @@ func (s *currentRoomStateStatements) UpsertRoomState(
 	}
 
 	// upsert state event
-	return s.writer.Do(s.db, txn, func(txn *sql.Tx) error {
-		stmt := sqlutil.TxStmt(txn, s.upsertRoomStateStmt)
-		_, err := stmt.ExecContext(
-			ctx,
-			event.RoomID(),
-			event.EventID(),
-			event.Type(),
-			event.Sender(),
-			containsURL,
-			*event.StateKey(),
-			headeredJSON,
-			membership,
-			addedAt,
-		)
-		return err
-	})
+	stmt := sqlutil.TxStmt(txn, s.upsertRoomStateStmt)
+	_, err = stmt.ExecContext(
+		ctx,
+		event.RoomID(),
+		event.EventID(),
+		event.Type(),
+		event.Sender(),
+		containsURL,
+		*event.StateKey(),
+		headeredJSON,
+		membership,
+		addedAt,
+	)
+	return err
 }
 
 func minOfInts(a, b int) int {

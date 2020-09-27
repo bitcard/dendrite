@@ -18,10 +18,14 @@ package sync
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/matrix-org/dendrite/clientapi/jsonerror"
+	keyapi "github.com/matrix-org/dendrite/keyserver/api"
+	roomserverAPI "github.com/matrix-org/dendrite/roomserver/api"
+	"github.com/matrix-org/dendrite/syncapi/internal"
 	"github.com/matrix-org/dendrite/syncapi/storage"
 	"github.com/matrix-org/dendrite/syncapi/types"
 	userapi "github.com/matrix-org/dendrite/userapi/api"
@@ -35,11 +39,16 @@ type RequestPool struct {
 	db       storage.Database
 	userAPI  userapi.UserInternalAPI
 	notifier *Notifier
+	keyAPI   keyapi.KeyInternalAPI
+	rsAPI    roomserverAPI.RoomserverInternalAPI
 }
 
 // NewRequestPool makes a new RequestPool
-func NewRequestPool(db storage.Database, n *Notifier, userAPI userapi.UserInternalAPI) *RequestPool {
-	return &RequestPool{db, userAPI, n}
+func NewRequestPool(
+	db storage.Database, n *Notifier, userAPI userapi.UserInternalAPI, keyAPI keyapi.KeyInternalAPI,
+	rsAPI roomserverAPI.RoomserverInternalAPI,
+) *RequestPool {
+	return &RequestPool{db, userAPI, n, keyAPI, rsAPI}
 }
 
 // OnIncomingSyncRequest is called when a client makes a /sync request. This function MUST be
@@ -135,10 +144,60 @@ func (rp *RequestPool) OnIncomingSyncRequest(req *http.Request, device *userapi.
 	}
 }
 
-func (rp *RequestPool) currentSyncForUser(req syncRequest, latestPos types.StreamingToken) (res *types.Response, err error) {
-	res = types.NewResponse()
+func (rp *RequestPool) OnIncomingKeyChangeRequest(req *http.Request, device *userapi.Device) util.JSONResponse {
+	from := req.URL.Query().Get("from")
+	to := req.URL.Query().Get("to")
+	if from == "" || to == "" {
+		return util.JSONResponse{
+			Code: 400,
+			JSON: jsonerror.InvalidArgumentValue("missing ?from= or ?to="),
+		}
+	}
+	fromToken, err := types.NewStreamTokenFromString(from)
+	if err != nil {
+		return util.JSONResponse{
+			Code: 400,
+			JSON: jsonerror.InvalidArgumentValue("bad 'from' value"),
+		}
+	}
+	toToken, err := types.NewStreamTokenFromString(to)
+	if err != nil {
+		return util.JSONResponse{
+			Code: 400,
+			JSON: jsonerror.InvalidArgumentValue("bad 'to' value"),
+		}
+	}
+	// work out room joins/leaves
+	res, err := rp.db.IncrementalSync(
+		req.Context(), types.NewResponse(), *device, fromToken, toToken, 10, false,
+	)
+	if err != nil {
+		util.GetLogger(req.Context()).WithError(err).Error("Failed to IncrementalSync")
+		return jsonerror.InternalServerError()
+	}
 
-	since := types.NewStreamToken(0, 0)
+	res, err = rp.appendDeviceLists(res, device.UserID, fromToken, toToken)
+	if err != nil {
+		util.GetLogger(req.Context()).WithError(err).Error("Failed to appendDeviceLists info")
+		return jsonerror.InternalServerError()
+	}
+	return util.JSONResponse{
+		Code: 200,
+		JSON: struct {
+			Changed []string `json:"changed"`
+			Left    []string `json:"left"`
+		}{
+			Changed: res.DeviceLists.Changed,
+			Left:    res.DeviceLists.Left,
+		},
+	}
+}
+
+// nolint:gocyclo
+func (rp *RequestPool) currentSyncForUser(req syncRequest, latestPos types.StreamingToken) (*types.Response, error) {
+	res := types.NewResponse()
+
+	since := types.NewStreamToken(0, 0, nil)
 	if req.since != nil {
 		since = *req.since
 	}
@@ -146,23 +205,34 @@ func (rp *RequestPool) currentSyncForUser(req syncRequest, latestPos types.Strea
 	// See if we have any new tasks to do for the send-to-device messaging.
 	events, updates, deletions, err := rp.db.SendToDeviceUpdatesForSync(req.ctx, req.device.UserID, req.device.ID, since)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("rp.db.SendToDeviceUpdatesForSync: %w", err)
 	}
 
 	// TODO: handle ignored users
 	if req.since == nil {
 		res, err = rp.db.CompleteSync(req.ctx, res, req.device, req.limit)
+		if err != nil {
+			return res, fmt.Errorf("rp.db.CompleteSync: %w", err)
+		}
 	} else {
 		res, err = rp.db.IncrementalSync(req.ctx, res, req.device, *req.since, latestPos, req.limit, req.wantFullState)
-	}
-	if err != nil {
-		return
+		if err != nil {
+			return res, fmt.Errorf("rp.db.IncrementalSync: %w", err)
+		}
 	}
 
 	accountDataFilter := gomatrixserverlib.DefaultEventFilter() // TODO: use filter provided in req instead
 	res, err = rp.appendAccountData(res, req.device.UserID, req, latestPos.PDUPosition(), &accountDataFilter)
 	if err != nil {
-		return
+		return res, fmt.Errorf("rp.appendAccountData: %w", err)
+	}
+	res, err = rp.appendDeviceLists(res, req.device.UserID, since, latestPos)
+	if err != nil {
+		return res, fmt.Errorf("rp.appendDeviceLists: %w", err)
+	}
+	err = internal.DeviceOTKCounts(req.ctx, rp.keyAPI, req.device.UserID, req.device.ID, res)
+	if err != nil {
+		return res, fmt.Errorf("internal.DeviceOTKCounts: %w", err)
 	}
 
 	// Before we return the sync response, make sure that we take action on
@@ -172,7 +242,7 @@ func (rp *RequestPool) currentSyncForUser(req syncRequest, latestPos types.Strea
 		// Handle the updates and deletions in the database.
 		err = rp.db.CleanSendToDeviceUpdates(context.Background(), updates, deletions, since)
 		if err != nil {
-			return
+			return res, fmt.Errorf("rp.db.CleanSendToDeviceUpdates: %w", err)
 		}
 	}
 	if len(events) > 0 {
@@ -189,7 +259,18 @@ func (rp *RequestPool) currentSyncForUser(req syncRequest, latestPos types.Strea
 		}
 	}
 
-	return
+	return res, err
+}
+
+func (rp *RequestPool) appendDeviceLists(
+	data *types.Response, userID string, since, to types.StreamingToken,
+) (*types.Response, error) {
+	_, err := internal.DeviceListCatchup(context.Background(), rp.keyAPI, rp.rsAPI, userID, data, since, to)
+	if err != nil {
+		return nil, fmt.Errorf("internal.DeviceListCatchup: %w", err)
+	}
+
+	return data, nil
 }
 
 // nolint:gocyclo
@@ -252,7 +333,7 @@ func (rp *RequestPool) appendAccountData(
 		req.ctx, userID, r, accountDataFilter,
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("rp.db.GetAccountDataInRange: %w", err)
 	}
 
 	if len(dataTypes) == 0 {

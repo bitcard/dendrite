@@ -16,27 +16,20 @@ package storage
 
 import (
 	"fmt"
-	"net/url"
 
-	"github.com/matrix-org/dendrite/internal/sqlutil"
+	"github.com/matrix-org/dendrite/internal/caching"
+	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/roomserver/storage/sqlite3"
 )
 
 // NewPublicRoomsServerDatabase opens a database connection.
-func Open(
-	dataSourceName string,
-	dbProperties sqlutil.DbProperties, // nolint:unparam
-) (Database, error) {
-	uri, err := url.Parse(dataSourceName)
-	if err != nil {
-		return nil, fmt.Errorf("Cannot use postgres implementation")
-	}
-	switch uri.Scheme {
-	case "postgres":
-		return nil, fmt.Errorf("Cannot use postgres implementation")
-	case "file":
-		return sqlite3.Open(dataSourceName)
+func Open(dbProperties *config.DatabaseOptions, cache caching.RoomServerCaches) (Database, error) {
+	switch {
+	case dbProperties.ConnectionString.IsSQLite():
+		return sqlite3.Open(dbProperties, cache)
+	case dbProperties.ConnectionString.IsPostgres():
+		return nil, fmt.Errorf("can't use Postgres implementation")
 	default:
-		return nil, fmt.Errorf("Cannot use postgres implementation")
+		return nil, fmt.Errorf("unexpected database type")
 	}
 }

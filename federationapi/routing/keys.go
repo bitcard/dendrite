@@ -19,11 +19,14 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/matrix-org/dendrite/clientapi/httputil"
 	"github.com/matrix-org/dendrite/clientapi/jsonerror"
+	federationSenderAPI "github.com/matrix-org/dendrite/federationsender/api"
 	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/keyserver/api"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/matrix-org/util"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ed25519"
 )
 
@@ -121,7 +124,7 @@ func ClaimOneTimeKeys(
 
 // LocalKeys returns the local keys for the server.
 // See https://matrix.org/docs/spec/server_server/unstable.html#publishing-keys
-func LocalKeys(cfg *config.Dendrite) util.JSONResponse {
+func LocalKeys(cfg *config.FederationAPI) util.JSONResponse {
 	keys, err := localKeys(cfg, time.Now().Add(cfg.Matrix.KeyValidityPeriod))
 	if err != nil {
 		return util.ErrorResponse(err)
@@ -129,10 +132,12 @@ func LocalKeys(cfg *config.Dendrite) util.JSONResponse {
 	return util.JSONResponse{Code: http.StatusOK, JSON: keys}
 }
 
-func localKeys(cfg *config.Dendrite, validUntil time.Time) (*gomatrixserverlib.ServerKeys, error) {
+func localKeys(cfg *config.FederationAPI, validUntil time.Time) (*gomatrixserverlib.ServerKeys, error) {
 	var keys gomatrixserverlib.ServerKeys
 
 	keys.ServerName = cfg.Matrix.ServerName
+	keys.TLSFingerprints = cfg.TLSFingerPrints
+	keys.ValidUntilTS = gomatrixserverlib.AsTimestamp(validUntil)
 
 	publicKey := cfg.Matrix.PrivateKey.Public().(ed25519.PublicKey)
 
@@ -142,9 +147,15 @@ func localKeys(cfg *config.Dendrite, validUntil time.Time) (*gomatrixserverlib.S
 		},
 	}
 
-	keys.TLSFingerprints = cfg.Matrix.TLSFingerPrints
 	keys.OldVerifyKeys = map[gomatrixserverlib.KeyID]gomatrixserverlib.OldVerifyKey{}
-	keys.ValidUntilTS = gomatrixserverlib.AsTimestamp(validUntil)
+	for _, oldVerifyKey := range cfg.Matrix.OldVerifyKeys {
+		keys.OldVerifyKeys[oldVerifyKey.KeyID] = gomatrixserverlib.OldVerifyKey{
+			VerifyKey: gomatrixserverlib.VerifyKey{
+				Key: gomatrixserverlib.Base64Bytes(oldVerifyKey.PrivateKey),
+			},
+			ExpiredTS: oldVerifyKey.ExpiredAt,
+		}
+	}
 
 	toSign, err := json.Marshal(keys.ServerKeyFields)
 	if err != nil {
@@ -159,4 +170,63 @@ func localKeys(cfg *config.Dendrite, validUntil time.Time) (*gomatrixserverlib.S
 	}
 
 	return &keys, nil
+}
+
+func NotaryKeys(
+	httpReq *http.Request, cfg *config.FederationAPI,
+	fsAPI federationSenderAPI.FederationSenderInternalAPI,
+	req *gomatrixserverlib.PublicKeyNotaryLookupRequest,
+) util.JSONResponse {
+	if req == nil {
+		req = &gomatrixserverlib.PublicKeyNotaryLookupRequest{}
+		if reqErr := httputil.UnmarshalJSONRequest(httpReq, &req); reqErr != nil {
+			return *reqErr
+		}
+	}
+
+	var response struct {
+		ServerKeys []json.RawMessage `json:"server_keys"`
+	}
+	response.ServerKeys = []json.RawMessage{}
+
+	for serverName := range req.ServerKeys {
+		var keys *gomatrixserverlib.ServerKeys
+		if serverName == cfg.Matrix.ServerName {
+			if k, err := localKeys(cfg, time.Now().Add(cfg.Matrix.KeyValidityPeriod)); err == nil {
+				keys = k
+			} else {
+				return util.ErrorResponse(err)
+			}
+		} else {
+			if k, err := fsAPI.GetServerKeys(httpReq.Context(), serverName); err == nil {
+				keys = &k
+			} else {
+				return util.ErrorResponse(err)
+			}
+		}
+		if keys == nil {
+			continue
+		}
+
+		j, err := json.Marshal(keys)
+		if err != nil {
+			logrus.WithError(err).Errorf("Failed to marshal %q response", serverName)
+			return jsonerror.InternalServerError()
+		}
+
+		js, err := gomatrixserverlib.SignJSON(
+			string(cfg.Matrix.ServerName), cfg.Matrix.KeyID, cfg.Matrix.PrivateKey, j,
+		)
+		if err != nil {
+			logrus.WithError(err).Errorf("Failed to sign %q response", serverName)
+			return jsonerror.InternalServerError()
+		}
+
+		response.ServerKeys = append(response.ServerKeys, js)
+	}
+
+	return util.JSONResponse{
+		Code: http.StatusOK,
+		JSON: response,
+	}
 }

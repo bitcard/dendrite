@@ -23,7 +23,6 @@ import (
 	"github.com/matrix-org/dendrite/clientapi/auth/authtypes"
 	"github.com/matrix-org/dendrite/clientapi/httputil"
 	"github.com/matrix-org/dendrite/clientapi/jsonerror"
-	currentstateAPI "github.com/matrix-org/dendrite/currentstateserver/api"
 	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/eventutil"
 	"github.com/matrix-org/dendrite/roomserver/api"
@@ -37,7 +36,7 @@ import (
 
 // GetProfile implements GET /profile/{userID}
 func GetProfile(
-	req *http.Request, accountDB accounts.Database, cfg *config.Dendrite,
+	req *http.Request, accountDB accounts.Database, cfg *config.ClientAPI,
 	userID string,
 	asAPI appserviceAPI.AppServiceQueryAPI,
 	federation *gomatrixserverlib.FederationClient,
@@ -66,7 +65,7 @@ func GetProfile(
 
 // GetAvatarURL implements GET /profile/{userID}/avatar_url
 func GetAvatarURL(
-	req *http.Request, accountDB accounts.Database, cfg *config.Dendrite,
+	req *http.Request, accountDB accounts.Database, cfg *config.ClientAPI,
 	userID string, asAPI appserviceAPI.AppServiceQueryAPI,
 	federation *gomatrixserverlib.FederationClient,
 ) util.JSONResponse {
@@ -94,8 +93,8 @@ func GetAvatarURL(
 // SetAvatarURL implements PUT /profile/{userID}/avatar_url
 // nolint:gocyclo
 func SetAvatarURL(
-	req *http.Request, accountDB accounts.Database, stateAPI currentstateAPI.CurrentStateInternalAPI,
-	device *userapi.Device, userID string, cfg *config.Dendrite, rsAPI api.RoomserverInternalAPI,
+	req *http.Request, accountDB accounts.Database,
+	device *userapi.Device, userID string, cfg *config.ClientAPI, rsAPI api.RoomserverInternalAPI,
 ) util.JSONResponse {
 	if userID != device.UserID {
 		return util.JSONResponse{
@@ -140,8 +139,8 @@ func SetAvatarURL(
 		return jsonerror.InternalServerError()
 	}
 
-	var res currentstateAPI.QueryRoomsForUserResponse
-	err = stateAPI.QueryRoomsForUser(req.Context(), &currentstateAPI.QueryRoomsForUserRequest{
+	var res api.QueryRoomsForUserResponse
+	err = rsAPI.QueryRoomsForUser(req.Context(), &api.QueryRoomsForUserRequest{
 		UserID:         device.UserID,
 		WantMembership: "join",
 	}, &res)
@@ -171,7 +170,7 @@ func SetAvatarURL(
 		return jsonerror.InternalServerError()
 	}
 
-	if _, err := api.SendEvents(req.Context(), rsAPI, events, cfg.Matrix.ServerName, nil); err != nil {
+	if err := api.SendEvents(req.Context(), rsAPI, events, cfg.Matrix.ServerName, nil); err != nil {
 		util.GetLogger(req.Context()).WithError(err).Error("SendEvents failed")
 		return jsonerror.InternalServerError()
 	}
@@ -184,7 +183,7 @@ func SetAvatarURL(
 
 // GetDisplayName implements GET /profile/{userID}/displayname
 func GetDisplayName(
-	req *http.Request, accountDB accounts.Database, cfg *config.Dendrite,
+	req *http.Request, accountDB accounts.Database, cfg *config.ClientAPI,
 	userID string, asAPI appserviceAPI.AppServiceQueryAPI,
 	federation *gomatrixserverlib.FederationClient,
 ) util.JSONResponse {
@@ -212,8 +211,8 @@ func GetDisplayName(
 // SetDisplayName implements PUT /profile/{userID}/displayname
 // nolint:gocyclo
 func SetDisplayName(
-	req *http.Request, accountDB accounts.Database, stateAPI currentstateAPI.CurrentStateInternalAPI,
-	device *userapi.Device, userID string, cfg *config.Dendrite, rsAPI api.RoomserverInternalAPI,
+	req *http.Request, accountDB accounts.Database,
+	device *userapi.Device, userID string, cfg *config.ClientAPI, rsAPI api.RoomserverInternalAPI,
 ) util.JSONResponse {
 	if userID != device.UserID {
 		return util.JSONResponse{
@@ -258,8 +257,8 @@ func SetDisplayName(
 		return jsonerror.InternalServerError()
 	}
 
-	var res currentstateAPI.QueryRoomsForUserResponse
-	err = stateAPI.QueryRoomsForUser(req.Context(), &currentstateAPI.QueryRoomsForUserRequest{
+	var res api.QueryRoomsForUserResponse
+	err = rsAPI.QueryRoomsForUser(req.Context(), &api.QueryRoomsForUserRequest{
 		UserID:         device.UserID,
 		WantMembership: "join",
 	}, &res)
@@ -289,7 +288,7 @@ func SetDisplayName(
 		return jsonerror.InternalServerError()
 	}
 
-	if _, err := api.SendEvents(req.Context(), rsAPI, events, cfg.Matrix.ServerName, nil); err != nil {
+	if err := api.SendEvents(req.Context(), rsAPI, events, cfg.Matrix.ServerName, nil); err != nil {
 		util.GetLogger(req.Context()).WithError(err).Error("SendEvents failed")
 		return jsonerror.InternalServerError()
 	}
@@ -305,7 +304,7 @@ func SetDisplayName(
 // Returns an error when something goes wrong or specifically
 // eventutil.ErrProfileNoExists when the profile doesn't exist.
 func getProfile(
-	ctx context.Context, accountDB accounts.Database, cfg *config.Dendrite,
+	ctx context.Context, accountDB accounts.Database, cfg *config.ClientAPI,
 	userID string,
 	asAPI appserviceAPI.AppServiceQueryAPI,
 	federation *gomatrixserverlib.FederationClient,
@@ -345,7 +344,7 @@ func getProfile(
 func buildMembershipEvents(
 	ctx context.Context,
 	roomIDs []string,
-	newProfile authtypes.Profile, userID string, cfg *config.Dendrite,
+	newProfile authtypes.Profile, userID string, cfg *config.ClientAPI,
 	evTime time.Time, rsAPI api.RoomserverInternalAPI,
 ) ([]gomatrixserverlib.HeaderedEvent, error) {
 	evs := []gomatrixserverlib.HeaderedEvent{}
@@ -375,7 +374,7 @@ func buildMembershipEvents(
 			return nil, err
 		}
 
-		event, err := eventutil.BuildEvent(ctx, &builder, cfg, evTime, rsAPI, nil)
+		event, err := eventutil.QueryAndBuildEvent(ctx, &builder, cfg.Matrix, evTime, rsAPI, nil)
 		if err != nil {
 			return nil, err
 		}

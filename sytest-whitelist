@@ -110,6 +110,7 @@ Rooms a user is invited to appear in an incremental sync
 Sync can be polled for updates
 Sync is woken up for leaves
 Newly left rooms appear in the leave section of incremental sync
+Rooms can be created with an initial invite list (SYN-205)
 We should see our own leave event, even if history_visibility is restricted (SYN-662)
 We should see our own leave event when rejecting an invite, even if history_visibility is restricted (riot-web/3462)
 Newly left rooms appear in the leave section of gapped sync
@@ -127,6 +128,27 @@ Can query specific device keys using POST
 query for user with no keys returns empty key dict
 Can claim one time key using POST
 Can claim remote one time key using POST
+Local device key changes appear in v2 /sync
+Local device key changes appear in /keys/changes
+New users appear in /keys/changes
+Local delete device changes appear in v2 /sync
+Local new device changes appear in v2 /sync
+Local update device changes appear in v2 /sync
+Users receive device_list updates for their own devices
+Get left notifs for other users in sync and /keys/changes when user leaves
+Local device key changes get to remote servers
+Local device key changes get to remote servers with correct prev_id
+Server correctly handles incoming m.device_list_update
+Device deletion propagates over federation
+If remote user leaves room, changes device and rejoins we see update in sync
+If remote user leaves room, changes device and rejoins we see update in /keys/changes
+If remote user leaves room we no longer receive device updates
+If a device list update goes missing, the server resyncs on the next one
+Get left notifs in sync and /keys/changes when other user leaves
+Can query remote device keys using POST after notification
+Server correctly resyncs when client query keys and there is no remote cache
+Server correctly resyncs when server leaves and rejoins a room
+Device list doesn't change if remote server is down
 Can add account data
 Can add account data to room
 Can get account data without syncing
@@ -396,10 +418,10 @@ Inbound federation rejects attempts to join v2 rooms from servers only supportin
 Outbound federation passes make_join failures through to the client
 Outbound federation correctly handles unsupported room versions
 Remote users may not join unfederated rooms
-Guest users denied access over federation if guest access prohibited
 Non-numeric ports in server names are rejected
 Invited user can reject invite over federation
 Invited user can reject invite over federation for empty room
+Invited user can reject invite over federation several times
 Can reject invites over federation for rooms with version 1
 Can reject invites over federation for rooms with version 2
 Can reject invites over federation for rooms with version 3
@@ -420,3 +442,41 @@ User directory correctly update on display name change
 User in shared private room does appear in user directory
 User in dir while user still shares private rooms
 Can get 'm.room.name' state for a departed room (SPEC-216)
+Banned servers cannot send events
+Banned servers cannot /make_join
+Banned servers cannot /send_join
+Banned servers cannot /make_leave
+Banned servers cannot /send_leave
+Banned servers cannot /invite
+Banned servers cannot get room state
+Banned servers cannot /event_auth
+Banned servers cannot get missing events
+Banned servers cannot get room state ids
+Banned servers cannot backfill
+Inbound /v1/send_leave rejects leaves from other servers
+Guest users can accept invites to private rooms over federation
+AS user (not ghost) can join room without registering
+If user leaves room, remote user changes device and rejoins we see update in /sync and /keys/changes
+Can search public room list
+Can get remote public room list
+Asking for a remote rooms list, but supplying the local server's name, returns the local rooms list
+After changing password, can't log in with old password
+After changing password, can log in with new password
+After changing password, existing session still works
+After changing password, different sessions can optionally be kept
+After changing password, a different session no longer works by default
+Local users can peek into world_readable rooms by room ID
+We can't peek into rooms with shared history_visibility
+We can't peek into rooms with invited history_visibility
+We can't peek into rooms with joined history_visibility
+Local users can peek by room alias
+Peeked rooms only turn up in the sync for the device who peeked them
+Room state at a rejected message event is the same as its predecessor
+Room state at a rejected state event is the same as its predecessor
+Inbound federation correctly soft fails events
+Inbound federation accepts a second soft-failed event
+Federation key API can act as a notary server via a POST request
+Federation key API can act as a notary server via a GET request
+Inbound /make_join rejects attempts to join rooms where all users have left
+Inbound federation rejects invites which include invalid JSON for room version 6
+Inbound federation rejects invite rejections which include invalid JSON for room version 6

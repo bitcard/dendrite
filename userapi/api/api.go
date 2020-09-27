@@ -26,7 +26,10 @@ import (
 type UserInternalAPI interface {
 	InputAccountData(ctx context.Context, req *InputAccountDataRequest, res *InputAccountDataResponse) error
 	PerformAccountCreation(ctx context.Context, req *PerformAccountCreationRequest, res *PerformAccountCreationResponse) error
+	PerformPasswordUpdate(ctx context.Context, req *PerformPasswordUpdateRequest, res *PerformPasswordUpdateResponse) error
 	PerformDeviceCreation(ctx context.Context, req *PerformDeviceCreationRequest, res *PerformDeviceCreationResponse) error
+	PerformDeviceDeletion(ctx context.Context, req *PerformDeviceDeletionRequest, res *PerformDeviceDeletionResponse) error
+	PerformDeviceUpdate(ctx context.Context, req *PerformDeviceUpdateRequest, res *PerformDeviceUpdateResponse) error
 	QueryProfile(ctx context.Context, req *QueryProfileRequest, res *QueryProfileResponse) error
 	QueryAccessToken(ctx context.Context, req *QueryAccessTokenRequest, res *QueryAccessTokenResponse) error
 	QueryDevices(ctx context.Context, req *QueryDevicesRequest, res *QueryDevicesResponse) error
@@ -45,6 +48,29 @@ type InputAccountDataRequest struct {
 
 // InputAccountDataResponse is the response for InputAccountData
 type InputAccountDataResponse struct {
+}
+
+type PerformDeviceUpdateRequest struct {
+	RequestingUserID string
+	DeviceID         string
+	DisplayName      *string
+}
+type PerformDeviceUpdateResponse struct {
+	DeviceExists bool
+	Forbidden    bool
+}
+
+type PerformDeviceDeletionRequest struct {
+	UserID string
+	// The devices to delete. An empty slice means delete all devices.
+	DeviceIDs []string
+	// The requesting device ID to exclude from deletion. This is needed
+	// so that a password change doesn't cause that client to be logged
+	// out. Only specify when DeviceIDs is empty.
+	ExceptDeviceID string
+}
+
+type PerformDeviceDeletionResponse struct {
 }
 
 // QueryDeviceInfosRequest is the request to QueryDeviceInfos
@@ -144,6 +170,18 @@ type PerformAccountCreationResponse struct {
 	Account        *Account
 }
 
+// PerformAccountCreationRequest is the request for PerformAccountCreation
+type PerformPasswordUpdateRequest struct {
+	Localpart string // Required: The localpart for this account.
+	Password  string // Required: The new password to set.
+}
+
+// PerformAccountCreationResponse is the response for PerformAccountCreation
+type PerformPasswordUpdateResponse struct {
+	PasswordUpdated bool
+	Account         *Account
+}
+
 // PerformDeviceCreationRequest is the request for PerformDeviceCreation
 type PerformDeviceCreationRequest struct {
 	Localpart   string
@@ -171,8 +209,7 @@ type Device struct {
 	// The unique ID of the session identified by the access token.
 	// Can be used as a secure substitution in places where data needs to be
 	// associated with access tokens.
-	SessionID int64
-	// TODO: display name, last used timestamp, keys, etc
+	SessionID   int64
 	DisplayName string
 }
 

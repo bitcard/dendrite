@@ -16,16 +16,13 @@ package main
 
 import (
 	"flag"
-	"net/http"
 	"os"
 
 	"github.com/matrix-org/dendrite/appservice"
-	"github.com/matrix-org/dendrite/currentstateserver"
 	"github.com/matrix-org/dendrite/eduserver"
 	"github.com/matrix-org/dendrite/eduserver/cache"
 	"github.com/matrix-org/dendrite/federationsender"
 	"github.com/matrix-org/dendrite/internal/config"
-	"github.com/matrix-org/dendrite/internal/httputil"
 	"github.com/matrix-org/dendrite/internal/setup"
 	"github.com/matrix-org/dendrite/keyserver"
 	"github.com/matrix-org/dendrite/roomserver"
@@ -33,8 +30,6 @@ import (
 	"github.com/matrix-org/dendrite/serverkeyapi"
 	"github.com/matrix-org/dendrite/userapi"
 	"github.com/matrix-org/gomatrixserverlib"
-
-	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -48,38 +43,43 @@ var (
 
 func main() {
 	cfg := setup.ParseFlags(true)
+	httpAddr := config.HTTPAddress("http://" + *httpBindAddr)
+	httpsAddr := config.HTTPAddress("https://" + *httpsBindAddr)
+
 	if *enableHTTPAPIs {
 		// If the HTTP APIs are enabled then we need to update the Listen
 		// statements in the configuration so that we know where to find
 		// the API endpoints. They'll listen on the same port as the monolith
 		// itself.
-		addr := config.Address(*httpBindAddr)
-		cfg.Listen.RoomServer = addr
-		cfg.Listen.EDUServer = addr
-		cfg.Listen.AppServiceAPI = addr
-		cfg.Listen.FederationSender = addr
-		cfg.Listen.ServerKeyAPI = addr
+		cfg.AppServiceAPI.InternalAPI.Connect = httpAddr
+		cfg.ClientAPI.InternalAPI.Connect = httpAddr
+		cfg.EDUServer.InternalAPI.Connect = httpAddr
+		cfg.FederationAPI.InternalAPI.Connect = httpAddr
+		cfg.FederationSender.InternalAPI.Connect = httpAddr
+		cfg.KeyServer.InternalAPI.Connect = httpAddr
+		cfg.MediaAPI.InternalAPI.Connect = httpAddr
+		cfg.RoomServer.InternalAPI.Connect = httpAddr
+		cfg.ServerKeyAPI.InternalAPI.Connect = httpAddr
+		cfg.SyncAPI.InternalAPI.Connect = httpAddr
 	}
 
 	base := setup.NewBaseDendrite(cfg, "Monolith", *enableHTTPAPIs)
 	defer base.Close() // nolint: errcheck
 
 	accountDB := base.CreateAccountsDB()
-	deviceDB := base.CreateDeviceDB()
 	federation := base.CreateFederationClient()
 
 	serverKeyAPI := serverkeyapi.NewInternalAPI(
-		base.Cfg, federation, base.Caches,
+		&base.Cfg.ServerKeyAPI, federation, base.Caches,
 	)
 	if base.UseHTTPAPIs {
 		serverkeyapi.AddInternalRoutes(base.InternalAPIMux, serverKeyAPI, base.Caches)
 		serverKeyAPI = base.ServerKeyAPIClient()
 	}
 	keyRing := serverKeyAPI.KeyRing()
-	userAPI := userapi.NewInternalAPI(accountDB, deviceDB, cfg.Matrix.ServerName, cfg.Derived.ApplicationServices)
 
 	rsImpl := roomserver.NewInternalAPI(
-		base, keyRing, federation,
+		base, keyRing,
 	)
 	// call functions directly on the impl unless running in HTTP mode
 	rsAPI := rsImpl
@@ -92,6 +92,21 @@ func main() {
 			Impl: rsAPI,
 		}
 	}
+
+	fsAPI := federationsender.NewInternalAPI(
+		base, federation, rsAPI, keyRing,
+	)
+	if base.UseHTTPAPIs {
+		federationsender.AddInternalRoutes(base.InternalAPIMux, fsAPI)
+		fsAPI = base.FederationSenderHTTPClient()
+	}
+	// The underlying roomserver implementation needs to be able to call the fedsender.
+	// This is different to rsAPI which can be the http client which doesn't need this dependency
+	rsImpl.SetFederationSenderAPI(fsAPI)
+
+	keyAPI := keyserver.NewInternalAPI(&base.Cfg.KeyServer, fsAPI, base.KafkaProducer)
+	userAPI := userapi.NewInternalAPI(accountDB, &cfg.UserAPI, cfg.Derived.ApplicationServices, keyAPI)
+	keyAPI.SetUserAPI(userAPI)
 
 	eduInputAPI := eduserver.NewInternalAPI(
 		base, cache.New(), userAPI,
@@ -107,25 +122,10 @@ func main() {
 		asAPI = base.AppserviceHTTPClient()
 	}
 
-	fsAPI := federationsender.NewInternalAPI(
-		base, federation, rsAPI, keyRing,
-	)
-	if base.UseHTTPAPIs {
-		federationsender.AddInternalRoutes(base.InternalAPIMux, fsAPI)
-		fsAPI = base.FederationSenderHTTPClient()
-	}
-	// The underlying roomserver implementation needs to be able to call the fedsender.
-	// This is different to rsAPI which can be the http client which doesn't need this dependency
-	rsImpl.SetFederationSenderAPI(fsAPI)
-
-	stateAPI := currentstateserver.NewInternalAPI(base.Cfg, base.KafkaConsumer)
-	keyAPI := keyserver.NewInternalAPI(base.Cfg, federation, userAPI, base.KafkaProducer)
-
 	monolith := setup.Monolith{
 		Config:        base.Cfg,
 		AccountDB:     accountDB,
-		DeviceDB:      deviceDB,
-		Client:        gomatrixserverlib.NewClient(),
+		Client:        gomatrixserverlib.NewClient(cfg.FederationSender.DisableTLSValidation),
 		FedClient:     federation,
 		KeyRing:       keyRing,
 		KafkaConsumer: base.KafkaConsumer,
@@ -136,42 +136,32 @@ func main() {
 		FederationSenderAPI: fsAPI,
 		RoomserverAPI:       rsAPI,
 		ServerKeyAPI:        serverKeyAPI,
-		StateAPI:            stateAPI,
 		UserAPI:             userAPI,
 		KeyAPI:              keyAPI,
 	}
-	monolith.AddAllPublicRoutes(base.PublicAPIMux)
-
-	httputil.SetupHTTPAPI(
-		base.BaseMux,
-		base.PublicAPIMux,
-		base.InternalAPIMux,
-		cfg,
-		base.UseHTTPAPIs,
+	monolith.AddAllPublicRoutes(
+		base.PublicClientAPIMux,
+		base.PublicFederationAPIMux,
+		base.PublicKeyAPIMux,
+		base.PublicMediaAPIMux,
 	)
 
 	// Expose the matrix APIs directly rather than putting them under a /api path.
 	go func() {
-		serv := http.Server{
-			Addr:         *httpBindAddr,
-			WriteTimeout: setup.HTTPServerTimeout,
-			Handler:      base.BaseMux,
-		}
-
-		logrus.Info("Listening on ", serv.Addr)
-		logrus.Fatal(serv.ListenAndServe())
+		base.SetupAndServeHTTP(
+			config.HTTPAddress(httpAddr), // internal API
+			config.HTTPAddress(httpAddr), // external API
+			nil, nil,                     // TLS settings
+		)
 	}()
 	// Handle HTTPS if certificate and key are provided
 	if *certFile != "" && *keyFile != "" {
 		go func() {
-			serv := http.Server{
-				Addr:         *httpsBindAddr,
-				WriteTimeout: setup.HTTPServerTimeout,
-				Handler:      base.BaseMux,
-			}
-
-			logrus.Info("Listening on ", serv.Addr)
-			logrus.Fatal(serv.ListenAndServeTLS(*certFile, *keyFile))
+			base.SetupAndServeHTTP(
+				config.HTTPAddress(httpsAddr), // internal API
+				config.HTTPAddress(httpsAddr), // external API
+				certFile, keyFile,             // TLS settings
+			)
 		}()
 	}
 
