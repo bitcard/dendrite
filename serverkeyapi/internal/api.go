@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/serverkeyapi/api"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/sirupsen/logrus"
@@ -18,6 +19,7 @@ type ServerKeyAPI struct {
 	ServerPublicKey   ed25519.PublicKey
 	ServerKeyID       gomatrixserverlib.KeyID
 	ServerKeyValidity time.Duration
+	OldServerKeys     []config.OldVerifyKeys
 
 	OurKeyRing gomatrixserverlib.KeyRing
 	FedClient  gomatrixserverlib.KeyClient
@@ -112,14 +114,17 @@ func (s *ServerKeyAPI) FetcherName() string {
 }
 
 // handleLocalKeys handles cases where the key request contains
-// a request for our own server keys.
+// a request for our own server keys, either current or old.
 func (s *ServerKeyAPI) handleLocalKeys(
 	_ context.Context,
 	requests map[gomatrixserverlib.PublicKeyLookupRequest]gomatrixserverlib.Timestamp,
 	results map[gomatrixserverlib.PublicKeyLookupRequest]gomatrixserverlib.PublicKeyLookupResult,
 ) {
 	for req := range requests {
-		if req.ServerName == s.ServerName {
+		if req.ServerName != s.ServerName {
+			continue
+		}
+		if req.KeyID == s.ServerKeyID {
 			// We found a key request that is supposed to be for our own
 			// keys. Remove it from the request list so we don't hit the
 			// database or the fetchers for it.
@@ -132,6 +137,28 @@ func (s *ServerKeyAPI) handleLocalKeys(
 				},
 				ExpiredTS:    gomatrixserverlib.PublicKeyNotExpired,
 				ValidUntilTS: gomatrixserverlib.AsTimestamp(time.Now().Add(s.ServerKeyValidity)),
+			}
+		} else {
+			// The key request doesn't match our current key. Let's see
+			// if it matches any of our old verify keys.
+			for _, oldVerifyKey := range s.OldServerKeys {
+				if req.KeyID == oldVerifyKey.KeyID {
+					// We found a key request that is supposed to be an expired
+					// key.
+					delete(requests, req)
+
+					// Insert our own key into the response.
+					results[req] = gomatrixserverlib.PublicKeyLookupResult{
+						VerifyKey: gomatrixserverlib.VerifyKey{
+							Key: gomatrixserverlib.Base64Bytes(oldVerifyKey.PrivateKey.Public().(ed25519.PublicKey)),
+						},
+						ExpiredTS:    oldVerifyKey.ExpiredAt,
+						ValidUntilTS: gomatrixserverlib.PublicKeyNotValid,
+					}
+
+					// No need to look at the other keys.
+					break
+				}
 			}
 		}
 	}
@@ -175,7 +202,7 @@ func (s *ServerKeyAPI) handleDatabaseKeys(
 // the remaining requests.
 func (s *ServerKeyAPI) handleFetcherKeys(
 	ctx context.Context,
-	now gomatrixserverlib.Timestamp,
+	_ gomatrixserverlib.Timestamp,
 	fetcher gomatrixserverlib.KeyFetcher,
 	requests map[gomatrixserverlib.PublicKeyLookupRequest]gomatrixserverlib.Timestamp,
 	results map[gomatrixserverlib.PublicKeyLookupRequest]gomatrixserverlib.PublicKeyLookupResult,
@@ -191,7 +218,7 @@ func (s *ServerKeyAPI) handleFetcherKeys(
 	// Try to fetch the keys.
 	fetcherResults, err := fetcher.FetchKeys(fetcherCtx, requests)
 	if err != nil {
-		return err
+		return fmt.Errorf("fetcher.FetchKeys: %w", err)
 	}
 
 	// Build a map of the results that we want to commit to the
@@ -201,6 +228,10 @@ func (s *ServerKeyAPI) handleFetcherKeys(
 
 	// Now let's look at the results that we got from this fetcher.
 	for req, res := range fetcherResults {
+		if req.ServerName == s.ServerName {
+			continue
+		}
+
 		if prev, ok := results[req]; ok {
 			// We've already got a previous entry for this request
 			// so let's see if the newly retrieved one contains a more
@@ -208,31 +239,24 @@ func (s *ServerKeyAPI) handleFetcherKeys(
 			if res.ValidUntilTS > prev.ValidUntilTS {
 				// This key is newer than the one we had so let's store
 				// it in the database.
-				if req.ServerName != s.ServerName {
-					storeResults[req] = res
-				}
+				storeResults[req] = res
 			}
 		} else {
 			// We didn't already have a previous entry for this request
 			// so store it in the database anyway for now.
-			if req.ServerName != s.ServerName {
-				storeResults[req] = res
-			}
+			storeResults[req] = res
 		}
 
 		// Update the results map with this new result. If nothing
 		// else, we can try verifying against this key.
 		results[req] = res
 
-		// If the key is valid right now then we can remove it from the
-		// request list as we won't need to re-fetch it.
-		if res.WasValidAt(now, true) {
-			delete(requests, req)
-		}
+		// Remove it from the request list so we won't re-fetch it.
+		delete(requests, req)
 	}
 
 	// Store the keys from our store map.
-	if err = s.OurKeyRing.KeyDatabase.StoreKeys(ctx, storeResults); err != nil {
+	if err = s.OurKeyRing.KeyDatabase.StoreKeys(context.Background(), storeResults); err != nil {
 		logrus.WithError(err).WithFields(logrus.Fields{
 			"fetcher_name":  fetcher.FetcherName(),
 			"database_name": s.OurKeyRing.KeyDatabase.FetcherName(),
@@ -243,7 +267,7 @@ func (s *ServerKeyAPI) handleFetcherKeys(
 	if len(storeResults) > 0 {
 		logrus.WithFields(logrus.Fields{
 			"fetcher_name": fetcher.FetcherName(),
-		}).Infof("Updated %d of %d key(s) in database", len(storeResults), len(results))
+		}).Infof("Updated %d of %d key(s) in database (%d keys remaining)", len(storeResults), len(results), len(requests))
 	}
 
 	return nil

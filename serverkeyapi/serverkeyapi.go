@@ -49,15 +49,27 @@ func NewInternalAPI(
 		ServerPublicKey:   cfg.Matrix.PrivateKey.Public().(ed25519.PublicKey),
 		ServerKeyID:       cfg.Matrix.KeyID,
 		ServerKeyValidity: cfg.Matrix.KeyValidityPeriod,
+		OldServerKeys:     cfg.Matrix.OldVerifyKeys,
 		FedClient:         fedClient,
 		OurKeyRing: gomatrixserverlib.KeyRing{
-			KeyFetchers: []gomatrixserverlib.KeyFetcher{
-				&gomatrixserverlib.DirectKeyFetcher{
-					Client: fedClient,
-				},
-			},
+			KeyFetchers: []gomatrixserverlib.KeyFetcher{},
 			KeyDatabase: serverKeyDB,
 		},
+	}
+
+	addDirectFetcher := func() {
+		internalAPI.OurKeyRing.KeyFetchers = append(
+			internalAPI.OurKeyRing.KeyFetchers,
+			&gomatrixserverlib.DirectKeyFetcher{
+				Client: fedClient,
+			},
+		)
+	}
+
+	if cfg.PreferDirectFetch {
+		addDirectFetcher()
+	} else {
+		defer addDirectFetcher()
 	}
 
 	var b64e = base64.StdEncoding.WithPadding(base64.NoPadding)
