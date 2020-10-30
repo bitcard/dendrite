@@ -15,8 +15,10 @@
 package setup
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"time"
@@ -25,14 +27,12 @@ import (
 	"github.com/matrix-org/dendrite/internal/httputil"
 	"github.com/matrix-org/gomatrixserverlib"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-
-	"github.com/matrix-org/naffka"
-	naffkaStorage "github.com/matrix-org/naffka/storage"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 
 	"github.com/matrix-org/dendrite/internal"
 	"github.com/matrix-org/dendrite/userapi/storage/accounts"
 
-	"github.com/Shopify/sarama"
 	"github.com/gorilla/mux"
 
 	appserviceAPI "github.com/matrix-org/dendrite/appservice/api"
@@ -73,8 +73,8 @@ type BaseDendrite struct {
 	httpClient             *http.Client
 	Cfg                    *config.Dendrite
 	Caches                 *caching.Caches
-	KafkaConsumer          sarama.Consumer
-	KafkaProducer          sarama.SyncProducer
+	//	KafkaConsumer          sarama.Consumer
+	//	KafkaProducer          sarama.SyncProducer
 }
 
 const HTTPServerTimeout = time.Minute * 5
@@ -106,20 +106,27 @@ func NewBaseDendrite(cfg *config.Dendrite, componentName string, useHTTPAPIs boo
 		logrus.WithError(err).Panicf("failed to start opentracing")
 	}
 
-	var kafkaConsumer sarama.Consumer
-	var kafkaProducer sarama.SyncProducer
-	if cfg.Global.Kafka.UseNaffka {
-		kafkaConsumer, kafkaProducer = setupNaffka(cfg)
-	} else {
-		kafkaConsumer, kafkaProducer = setupKafka(cfg)
-	}
-
 	cache, err := caching.NewInMemoryLRUCache(true)
 	if err != nil {
 		logrus.WithError(err).Warnf("Failed to create cache")
 	}
 
-	apiClient := http.Client{Timeout: time.Minute * 10}
+	apiClient := http.Client{
+		Timeout: time.Minute * 10,
+		Transport: &http2.Transport{
+			AllowHTTP: true,
+			DialTLS: func(network, addr string, _ *tls.Config) (net.Conn, error) {
+				// Ordinarily HTTP/2 would expect TLS, but the remote listener is
+				// H2C-enabled (HTTP/2 without encryption). Overriding the DialTLS
+				// function with a plain Dial allows us to trick the HTTP client
+				// into establishing a HTTP/2 connection without TLS.
+				// TODO: Eventually we will want to look at authenticating and
+				// encrypting these internal HTTP APIs, at which point we will have
+				// to reconsider H2C and change all this anyway.
+				return net.Dial(network, addr)
+			},
+		},
+	}
 	client := http.Client{Timeout: HTTPClientTimeout}
 	if cfg.FederationSender.Proxy.Enabled {
 		client.Transport = &http.Transport{Proxy: http.ProxyURL(&url.URL{
@@ -152,8 +159,6 @@ func NewBaseDendrite(cfg *config.Dendrite, componentName string, useHTTPAPIs boo
 		InternalAPIMux:         mux.NewRouter().SkipClean(true).PathPrefix(httputil.InternalPathPrefix).Subrouter().UseEncodedPath(),
 		apiHttpClient:          &apiClient,
 		httpClient:             &client,
-		KafkaConsumer:          kafkaConsumer,
-		KafkaProducer:          kafkaProducer,
 	}
 }
 
@@ -254,9 +259,9 @@ func (b *BaseDendrite) CreateClient() *gomatrixserverlib.Client {
 // CreateFederationClient creates a new federation client. Should only be called
 // once per component.
 func (b *BaseDendrite) CreateFederationClient() *gomatrixserverlib.FederationClient {
-	client := gomatrixserverlib.NewFederationClient(
+	client := gomatrixserverlib.NewFederationClientWithTimeout(
 		b.Cfg.Global.ServerName, b.Cfg.Global.KeyID, b.Cfg.Global.PrivateKey,
-		b.Cfg.FederationSender.DisableTLSValidation,
+		b.Cfg.FederationSender.DisableTLSValidation, time.Minute*5,
 	)
 	client.SetUserAgent(fmt.Sprintf("Dendrite/%s", internal.VersionString()))
 	return client
@@ -283,10 +288,17 @@ func (b *BaseDendrite) SetupAndServeHTTP(
 	internalServ := externalServ
 
 	if internalAddr != NoListener && externalAddr != internalAddr {
+		// H2C allows us to accept HTTP/2 connections without TLS
+		// encryption. Since we don't currently require any form of
+		// authentication or encryption on these internal HTTP APIs,
+		// H2C gives us all of the advantages of HTTP/2 (such as
+		// stream multiplexing and avoiding head-of-line blocking)
+		// without enabling TLS.
+		internalH2S := &http2.Server{}
 		internalRouter = mux.NewRouter().SkipClean(true).UseEncodedPath()
 		internalServ = &http.Server{
 			Addr:    string(internalAddr),
-			Handler: internalRouter,
+			Handler: h2c.NewHandler(internalRouter, internalH2S),
 		}
 	}
 
@@ -333,32 +345,4 @@ func (b *BaseDendrite) SetupAndServeHTTP(
 	}
 
 	select {}
-}
-
-// setupKafka creates kafka consumer/producer pair from the config.
-func setupKafka(cfg *config.Dendrite) (sarama.Consumer, sarama.SyncProducer) {
-	consumer, err := sarama.NewConsumer(cfg.Global.Kafka.Addresses, nil)
-	if err != nil {
-		logrus.WithError(err).Panic("failed to start kafka consumer")
-	}
-
-	producer, err := sarama.NewSyncProducer(cfg.Global.Kafka.Addresses, nil)
-	if err != nil {
-		logrus.WithError(err).Panic("failed to setup kafka producers")
-	}
-
-	return consumer, producer
-}
-
-// setupNaffka creates kafka consumer/producer pair from the config.
-func setupNaffka(cfg *config.Dendrite) (sarama.Consumer, sarama.SyncProducer) {
-	naffkaDB, err := naffkaStorage.NewDatabase(string(cfg.Global.Kafka.Database.ConnectionString))
-	if err != nil {
-		logrus.WithError(err).Panic("Failed to setup naffka database")
-	}
-	naff, err := naffka.New(naffkaDB)
-	if err != nil {
-		logrus.WithError(err).Panic("Failed to setup naffka")
-	}
-	return naff, naff
 }

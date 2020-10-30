@@ -1,4 +1,4 @@
-// Copyright 2017 Vector Creations Ltd
+// Copyright 2020 The Matrix.org Foundation C.I.C.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,32 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package main
+package personalities
 
 import (
+	"github.com/matrix-org/dendrite/eduserver"
+	"github.com/matrix-org/dendrite/eduserver/cache"
+	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/setup"
-	"github.com/matrix-org/dendrite/syncapi"
 )
 
-func main() {
-	cfg := setup.ParseFlags(false)
-	base := setup.NewBaseDendrite(cfg, "SyncAPI", true)
-	defer base.Close() // nolint: errcheck
-
-	userAPI := base.UserAPIClient()
-	federation := base.CreateFederationClient()
-
-	rsAPI := base.RoomserverHTTPClient()
-
-	syncapi.AddPublicRoutes(
-		base.PublicClientAPIMux, base.KafkaConsumer, userAPI, rsAPI,
-		base.KeyServerHTTPClient(),
-		federation, &cfg.SyncAPI,
-	)
+func EDUServer(base *setup.BaseDendrite, cfg *config.Dendrite) {
+	intAPI := eduserver.NewInternalAPI(base, cache.New(), base.UserAPIClient())
+	eduserver.AddInternalRoutes(base.InternalAPIMux, intAPI)
 
 	base.SetupAndServeHTTP(
-		base.Cfg.SyncAPI.InternalAPI.Listen,
-		base.Cfg.SyncAPI.ExternalAPI.Listen,
+		base.Cfg.EDUServer.InternalAPI.Listen, // internal listener
+		setup.NoListener,                      // external listener
 		nil, nil,
 	)
 }

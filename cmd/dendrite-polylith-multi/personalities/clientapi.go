@@ -1,4 +1,4 @@
-// Copyright 2017 Vector Creations Ltd
+// Copyright 2020 The Matrix.org Foundation C.I.C.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,20 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package main
+package personalities
 
 import (
 	"github.com/matrix-org/dendrite/clientapi"
+	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/setup"
 	"github.com/matrix-org/dendrite/internal/transactions"
 )
 
-func main() {
-	cfg := setup.ParseFlags(false)
-
-	base := setup.NewBaseDendrite(cfg, "ClientAPI", true)
-	defer base.Close() // nolint: errcheck
-
+func ClientAPI(base *setup.BaseDendrite, cfg *config.Dendrite) {
 	accountDB := base.CreateAccountsDB()
 	federation := base.CreateFederationClient()
 
@@ -37,7 +33,7 @@ func main() {
 	keyAPI := base.KeyServerHTTPClient()
 
 	clientapi.AddPublicRoutes(
-		base.PublicClientAPIMux, &base.Cfg.ClientAPI, base.KafkaProducer, accountDB, federation,
+		base.PublicClientAPIMux, &base.Cfg.ClientAPI, accountDB, federation,
 		rsAPI, eduInputAPI, asQuery, transactions.New(), fsAPI, userAPI, keyAPI, nil,
 	)
 

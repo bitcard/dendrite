@@ -54,28 +54,30 @@ The following instructions are enough to get Dendrite started as a non-federatin
 ```bash
 $ git clone https://github.com/matrix-org/dendrite
 $ cd dendrite
+$ ./build.sh
 
-# generate self-signed certificate and an event signing key for federation
-$ go build ./cmd/generate-keys
-$ ./generate-keys --private-key matrix_key.pem --tls-cert server.crt --tls-key server.key
+# Generate a Matrix signing key for federation (required)
+$ ./generate-keys --private-key matrix_key.pem
 
-# Copy and modify the config file:
-# you'll need to set a server name and paths to the keys at the very least, along with setting
-# up the database filenames
+# Generate a self-signed certificate (optional, but a valid TLS certificate is normally
+# needed for Matrix federation/clients to work properly!)
+$ ./generate-keys --tls-cert server.crt --tls-key server.key
+
+# Copy and modify the config file - you'll need to set a server name and paths to the keys
+# at the very least, along with setting up the database connection strings.
 $ cp dendrite-config.yaml dendrite.yaml
 
-# build and run the server
-$ go build ./cmd/dendrite-monolith-server
+# Build and run the server:
 $ ./dendrite-monolith-server --tls-cert server.crt --tls-key server.key --config dendrite.yaml
 ```
 
-Then point your favourite Matrix client at `http://localhost:8008`.
+Then point your favourite Matrix client at `http://localhost:8008` or `https://localhost:8448`.
 
 ## Progress
 
 We use a script called Are We Synapse Yet which checks Sytest compliance rates. Sytest is a black-box homeserver
 test rig with around 900 tests. The script works out how many of these tests are passing on Dendrite and it
-updates with CI. As of October 2020 we're at around 56% CS API coverage and 77% Federation coverage, though check
+updates with CI. As of October 2020 we're at around 57% CS API coverage and 81% Federation coverage, though check
 CI for the latest numbers. In practice, this means you can communicate locally and via federation with Synapse
 servers such as matrix.org reasonably well. There's a long list of features that are not implemented, notably:
  - Receipts

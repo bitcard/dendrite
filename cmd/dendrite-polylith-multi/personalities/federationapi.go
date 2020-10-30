@@ -12,26 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package main
+package personalities
 
 import (
+	"github.com/matrix-org/dendrite/federationapi"
+	"github.com/matrix-org/dendrite/internal/config"
 	"github.com/matrix-org/dendrite/internal/setup"
-	"github.com/matrix-org/dendrite/signingkeyserver"
 )
 
-func main() {
-	cfg := setup.ParseFlags(false)
-	base := setup.NewBaseDendrite(cfg, "SigningKeyServer", true)
-	defer base.Close() // nolint: errcheck
-
+func FederationAPI(base *setup.BaseDendrite, cfg *config.Dendrite) {
+	userAPI := base.UserAPIClient()
 	federation := base.CreateFederationClient()
+	serverKeyAPI := base.SigningKeyServerHTTPClient()
+	keyRing := serverKeyAPI.KeyRing()
+	fsAPI := base.FederationSenderHTTPClient()
+	rsAPI := base.RoomserverHTTPClient()
+	keyAPI := base.KeyServerHTTPClient()
 
-	intAPI := signingkeyserver.NewInternalAPI(&base.Cfg.SigningKeyServer, federation, base.Caches)
-	signingkeyserver.AddInternalRoutes(base.InternalAPIMux, intAPI, base.Caches)
+	federationapi.AddPublicRoutes(
+		base.PublicFederationAPIMux, base.PublicKeyAPIMux,
+		&base.Cfg.FederationAPI, userAPI, federation, keyRing,
+		rsAPI, fsAPI, base.EDUServerClient(), keyAPI,
+	)
 
 	base.SetupAndServeHTTP(
-		base.Cfg.SigningKeyServer.InternalAPI.Listen,
-		setup.NoListener,
+		base.Cfg.FederationAPI.InternalAPI.Listen,
+		base.Cfg.FederationAPI.ExternalAPI.Listen,
 		nil, nil,
 	)
 }
